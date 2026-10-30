@@ -1,0 +1,31 @@
+{
+  "status": "experimental",
+  "tag": "v0.1.0-rc.2",
+  "candidate_origin": "aa0cde67641abbf010b66da974aa708a91226499",
+  "comparison": {
+    "limitation": "One scene, short movement test; no campaign or stable 30 FPS validation",
+    "method": "Stationary same-process A/B/A/B/A; task backend held at 1; cluster 0/2",
+    "candidate_fps": [
+      18.57,
+      19.1
+    ],
+    "control_fps": [
+      18.04,
+      17.52,
+      18.36
+    ]
+  },
+  "stable_validation": false,
+  "movement_seconds": 60,
+  "normal_exit": true,
+  "native_tests_passed": true,
+  "native_tests": [
+    "memory_tracker",
+    "resource_tracking",
+    "resource_materialization",
+    "srt_native",
+    "program_disk_cache"
+  ],
+  "validated_commit": "e820737ecb29d5cefded36bd999a37ec123fc504",
+  "hardware": "Ryzen 7 9800X3D, RTX 5070, 32 GB RAM"
+}

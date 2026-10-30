@@ -15,8 +15,12 @@ foreach($file in 'Start-Wolverine.ps1','Play Wolverine.bat') {
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot $file) -Destination $stage
 }
 Copy-Item -LiteralPath (Join-Path $root 'LICENSE') -Destination $stage
-Copy-Item -LiteralPath (Join-Path $root 'LICENSES') -Destination $stage -Recurse
-Copy-Item -LiteralPath (Join-Path $root '3rdparty/winpthread/COPYING') -Destination (Join-Path $stage 'LICENSES/winpthread-COPYING.txt')
+$licenses=Join-Path $stage 'licenses'
+New-Item -ItemType Directory -Path $licenses -Force | Out-Null
+foreach($entry in Get-ChildItem -LiteralPath (Join-Path $root 'LICENSES')) {
+    Copy-Item -LiteralPath $entry.FullName -Destination $licenses -Recurse -Force
+}
+Copy-Item -LiteralPath (Join-Path $root '3rdparty/winpthread/COPYING') -Destination (Join-Path $licenses 'winpthread-COPYING.txt')
 Copy-Item -LiteralPath (Join-Path $root 'README.md') -Destination (Join-Path $stage 'LEIA-ME.md')
 Copy-Item -LiteralPath (Join-Path $root 'docs') -Destination (Join-Path $stage 'docs') -Recurse
 Copy-Item -LiteralPath (Join-Path $root 'research') -Destination (Join-Path $stage 'research') -Recurse
