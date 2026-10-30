@@ -62,6 +62,9 @@ Os detalhes dos métodos ficam em [research/](research/).
 
 ## Baixar e executar
 
+Testado em **Windows 11 x64**, com driver de GPU compatível com **Vulkan 1.3**.
+O executável também utiliza o [Visual C++ v14 Redistributable x64 da Microsoft](https://aka.ms/vc14/vc_redist.x64.exe).
+
 1. Abra [Releases](https://github.com/calang000/KytyPS5-Wolverine/releases) e
    baixe o ZIP **Windows x64**. As primeiras versões são pré-releases.
 2. Extraia tudo para uma pasta com permissão de escrita.
