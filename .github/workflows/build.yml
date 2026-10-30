@@ -2,7 +2,6 @@ name: Wolverine Windows
 
 on:
   push:
-    branches: [wolverine-main]
     tags: ['v[0-9]*']
   pull_request:
   workflow_dispatch:

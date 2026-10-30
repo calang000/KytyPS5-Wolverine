@@ -16,8 +16,10 @@ foreach($file in 'Start-Wolverine.ps1','Play Wolverine.bat') {
 }
 Copy-Item -LiteralPath (Join-Path $root 'LICENSE') -Destination $stage
 Copy-Item -LiteralPath (Join-Path $root 'LICENSES') -Destination $stage -Recurse
+Copy-Item -LiteralPath (Join-Path $root '3rdparty/winpthread/COPYING') -Destination (Join-Path $stage 'LICENSES/winpthread-COPYING.txt')
 Copy-Item -LiteralPath (Join-Path $root 'README.md') -Destination (Join-Path $stage 'LEIA-ME.md')
 Copy-Item -LiteralPath (Join-Path $root 'docs') -Destination (Join-Path $stage 'docs') -Recurse
+Copy-Item -LiteralPath (Join-Path $root 'research') -Destination (Join-Path $stage 'research') -Recurse
 $revision=(& git -C $root rev-parse HEAD).Trim()
 if($LASTEXITCODE){throw 'Cannot determine source revision'}
 $hash=(Get-FileHash -LiteralPath (Join-Path $stage 'kyty_emulator.exe') -Algorithm SHA256).Hash
