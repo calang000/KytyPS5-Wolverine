@@ -38,6 +38,8 @@
 #include <atomic>
 #include <bit>
 #include <cmath>
+#include <chrono>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <limits>
@@ -49,6 +51,48 @@
 #include <vector>
 
 namespace Libs::Graphics {
+
+namespace {
+bool MeshIndirectGpuEnabled() {
+	static const bool compiled = [] {
+		const auto* value = std::getenv("KYTY_MESH_TASK_INDIRECT");
+		return value != nullptr && std::atoi(value) != 0;
+	}();
+	static auto& runtime = Common::LiveSwitches::Get("KYTY_MESH_TASK_RUNTIME", 1);
+	return compiled && runtime.load(std::memory_order_relaxed) != 0;
+}
+
+// Opt-in diagnostics. Keep clocks and counters out of performance comparisons.
+bool MeshIndirectStatsEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_MESH_TASK_STATS");
+		return value != nullptr && std::atoi(value) != 0;
+	}();
+	return enabled;
+}
+enum class MeshIndirectEvent : uint32_t { Attempt, Submit, LateFallback, HostIndexed, HostAuto, Native, ZeroIndexed, ZeroAuto, Count };
+void MeshIndirectObserve(MeshIndirectEvent event, double host_us = 0) {
+	if (!MeshIndirectStatsEnabled()) return;
+	struct Stats {
+		std::array<uint64_t, static_cast<size_t>(MeshIndirectEvent::Count)> counts {};
+		double host_us = 0;
+		std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+	};
+	static thread_local Stats stats;
+	++stats.counts[static_cast<size_t>(event)];
+	stats.host_us += host_us;
+	const auto now = std::chrono::steady_clock::now();
+	if (now - stats.start < std::chrono::seconds(5)) return;
+	std::printf("Mesh indirect (5 s): task_attempt=%llu task_submit=%llu late_fallback=%llu host_indexed=%llu host_auto=%llu native=%llu zero_indexed=%llu zero_auto=%llu host_read_ms=%.3f\n",
+	    static_cast<unsigned long long>(stats.counts[0]), static_cast<unsigned long long>(stats.counts[1]),
+	    static_cast<unsigned long long>(stats.counts[2]), static_cast<unsigned long long>(stats.counts[3]),
+	    static_cast<unsigned long long>(stats.counts[4]), static_cast<unsigned long long>(stats.counts[5]),
+	    static_cast<unsigned long long>(stats.counts[6]), static_cast<unsigned long long>(stats.counts[7]),
+	    stats.host_us / 1000.0);
+	std::fflush(stdout);
+	stats = {};
+}
+} // namespace
 
 std::pair<int32_t, uint32_t> ResolveDrawOffsets(uint32_t index_offset,
 	                                           const ShaderVertexInputInfo& vs_input_info) {
@@ -695,6 +739,8 @@ struct DrawEmitInfo {
 	uint32_t first_instance = 0;
 	// Research: guest address of indirect arguments the GPU reads itself (0: CPU counts).
 	uint64_t indirect_args = 0;
+	bool mesh_gpu_indirect = false;
+	bool force_host_indirect = false;
 };
 
 struct DrawIndexBufferSource {
@@ -1128,7 +1174,21 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	const bool mesh = state.vertex_info[0].stage.program->stage == ShaderType::Mesh;
 	const bool quad =
 	    buffer.GetUserConfig().GetPrimType() == Prospero::PrimitiveType::kQuadListLegacy;
+	if (emit.indirect_args != 0 && (emit.indirect_args & 3u) == 0 && mesh &&
+	    !draw.IsIndexed() && !quad && !emit.force_host_indirect && !primitive_restart_enable &&
+	    state.vertex_info[0].mesh.primitives_per_group != 0 &&
+	    m_context.GetGraphics().task_shader_enabled && MeshIndirectGpuEnabled() &&
+	    !m_context.GetBufferCache().IsCleanForConcurrentRead(
+	        emit.indirect_args, sizeof(vk::DrawIndirectCommand))) {
+		auto gpu_emit = emit;
+		MeshIndirectObserve(MeshIndirectEvent::Attempt);
+		gpu_emit.mesh_gpu_indirect = true;
+		ExecutePreparedDrawResolved(submit_id, buffer, draw, state, topology, gpu_emit,
+		                            index_source, primitive_restart_enable);
+		return;
+	}
 	if (emit.indirect_args == 0 || (!mesh && !quad)) {
+		if (emit.indirect_args != 0) MeshIndirectObserve(MeshIndirectEvent::Native);
 		ExecutePreparedDrawResolved(submit_id, buffer, draw, state, topology, emit, index_source,
 		                            primitive_restart_enable);
 		return;
@@ -1139,10 +1199,15 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	auto resolved_emit  = emit;
 	auto resolved_index = index_source;
 	resolved_emit.indirect_args = 0;
+	const auto read_start = MeshIndirectStatsEnabled() ? std::chrono::steady_clock::now()
+	                                                 : std::chrono::steady_clock::time_point {};
 	if (draw.IsIndexed()) {
 		vk::DrawIndexedIndirectCommand args {};
 		std::memcpy(&args, reinterpret_cast<const void*>(emit.indirect_args), sizeof(args));
+		if (MeshIndirectStatsEnabled()) MeshIndirectObserve(MeshIndirectEvent::HostIndexed,
+		    std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now()-read_start).count());
 		if (args.indexCount == 0 || args.instanceCount == 0) {
+			MeshIndirectObserve(MeshIndirectEvent::ZeroIndexed);
 			return;
 		}
 		resolved_draw.index_count    = std::min(args.indexCount, draw.index_count);
@@ -1157,7 +1222,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	} else {
 		vk::DrawIndirectCommand args {};
 		std::memcpy(&args, reinterpret_cast<const void*>(emit.indirect_args), sizeof(args));
+		if (MeshIndirectStatsEnabled()) MeshIndirectObserve(MeshIndirectEvent::HostAuto,
+		    std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now()-read_start).count());
 		if (args.vertexCount == 0 || args.instanceCount == 0) {
+			MeshIndirectObserve(MeshIndirectEvent::ZeroAuto);
 			return;
 		}
 		resolved_draw.index_count    = args.vertexCount;
@@ -1180,8 +1248,9 @@ void RenderExecutor::ExecutePreparedDrawResolved(uint64_t submit_id, CommandBuff
 	const auto vertex_stages =
 	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};
 	const bool mesh_active = state.vertex_info[0].stage.program->stage == ShaderType::Mesh;
+	const bool gpu_mesh_indirect = mesh_active && emit.mesh_gpu_indirect;
 	uint32_t   mesh_groups = 0;
-	if (mesh_active) {
+	if (mesh_active && !gpu_mesh_indirect) {
 		const auto& mesh = state.vertex_info[0].mesh;
 		EXIT_NOT_IMPLEMENTED(mesh.fast_launch && (draw.IsIndexed() || primitive_restart_enable));
 		static std::atomic_bool restart_warned = false;
@@ -1237,6 +1306,15 @@ void RenderExecutor::ExecutePreparedDrawResolved(uint64_t submit_id, CommandBuff
 		descriptor_stages[stage_count++] = &*bindings.pixel;
 	}
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
+	if (gpu_mesh_indirect) {
+		EXIT_IF(draw.IsIndexed() || emit.indirect_args == 0 || primitive_restart_enable);
+		// Register/synchronize before final bindings; this can merge buffers.
+		// Resolve the BDA again after preparation that may submit/delete them.
+		const auto [args, offset] = m_context.GetBufferCache().ObtainBuffer(
+		    emit.indirect_args, sizeof(vk::DrawIndirectCommand), false, false, {}, true);
+		EXIT_IF(args == nullptr || !args->HasDeviceAddress());
+		(void)offset;
+	}
 	PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;
@@ -1247,7 +1325,7 @@ void RenderExecutor::ExecutePreparedDrawResolved(uint64_t submit_id, CommandBuff
 	}
 	Buffer*  indirect_buffer = nullptr;
 	uint64_t indirect_offset = 0;
-	if (emit.indirect_args != 0) {
+	if (emit.indirect_args != 0 && !gpu_mesh_indirect) {
 		EXIT_IF(mesh_active || (emit.indirect_args & 3u) != 0);
 		const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
 		    emit.indirect_args, draw.IsIndexed() ? sizeof(vk::DrawIndexedIndirectCommand)
@@ -1277,7 +1355,7 @@ void RenderExecutor::ExecutePreparedDrawResolved(uint64_t submit_id, CommandBuff
 	auto* deferred_pipeline = m_context.GetPipelineCache().TryGetGraphicsPipeline(
 	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
-	    state.programs, may_defer);
+	    state.programs, may_defer, gpu_mesh_indirect);
 	if (deferred_pipeline == nullptr) {
 		return;
 	}
@@ -1290,6 +1368,20 @@ void RenderExecutor::ExecutePreparedDrawResolved(uint64_t submit_id, CommandBuff
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
 	// memory.
+	uint64_t task_args_address = 0;
+	if (gpu_mesh_indirect) {
+		task_args_address = m_context.GetBufferCache().CachedDeviceAddress(
+		    emit.indirect_args, sizeof(vk::DrawIndirectCommand));
+		if (task_args_address == 0) {
+			MeshIndirectObserve(MeshIndirectEvent::LateFallback);
+			auto fallback = emit;
+			fallback.mesh_gpu_indirect = false;
+			fallback.force_host_indirect = true;
+			ExecutePreparedDraw(submit_id, buffer, draw, state, topology, fallback,
+			                    index_source, primitive_restart_enable);
+			return;
+		}
+	}
 	const auto vk_buffer = buffer.Recorder();
 	if (indirect_buffer != nullptr) {
 		// Earlier passes wrote the arguments; indirect reads happen outside the render pass.
@@ -1325,16 +1417,22 @@ void RenderExecutor::ExecutePreparedDrawResolved(uint64_t submit_id, CommandBuff
 	}
 	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
 	if (mesh_active) {
-		const uint32_t draw_data[] {
+		uint32_t draw_data[] {
 		    draw.index_count,
 		    draw.IsIndexed() ? static_cast<uint32_t>(emit.vertex_offset) : emit.first_vertex,
 		    emit.first_instance, index_source.guest_element_size,
 		    static_cast<uint32_t>(index_source.address),
 		    static_cast<uint32_t>(index_source.address >> 32u)};
 		static_assert(std::size(draw_data) == ShaderRecompiler::IR::PushData::MeshDrawDwordCount);
+		if (gpu_mesh_indirect) {
+			draw_data[3] = ShaderRecompiler::IR::PushData::MeshIndirectTag;
+			draw_data[4] = static_cast<uint32_t>(task_args_address);
+			draw_data[5] = static_cast<uint32_t>(task_args_address >> 32u);
+		}
+		auto push_stages = vk::ShaderStageFlagBits::eMeshEXT | vk::ShaderStageFlagBits::eFragment;
+		if (m_context.GetGraphics().task_shader_enabled) push_stages |= vk::ShaderStageFlagBits::eTaskEXT;
 		vk_buffer.pushConstants(pipeline.pipeline_layout,
-		                        vk::ShaderStageFlagBits::eMeshEXT |
-		                            vk::ShaderStageFlagBits::eFragment,
+		                        push_stages,
 		                        0, sizeof(draw_data), draw_data);
 	} else {
 		CommitIndexBuffer(vk_buffer, index_binding);
@@ -1357,15 +1455,31 @@ void RenderExecutor::ExecutePreparedDrawResolved(uint64_t submit_id, CommandBuff
 		vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
 		cached.pipeline = pipeline.pipeline;
 	}
+	if (m_context.GetGraphics().fragment_shading_rate_2x2_enabled) {
+		static auto& vrs_rate = Common::LiveSwitches::Get("KYTY_VRS_RATE", 1);
+		const bool coarse = vrs_rate.load(std::memory_order_relaxed) >= 2 &&
+		                    pipeline.samples == 1 && state.ps_active;
+		vk_buffer.setFragmentShadingRateKHR({coarse ? 2u : 1u, coarse ? 2u : 1u});
+	}
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u, ps_hash);
 	}
+	const bool gpu_draw_sample =
+	    m_context.GetCommandScheduler().BeginGpuDrawSample(buffer, ps_hash);
 	if (mesh_active) {
-		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
+		if (gpu_mesh_indirect) {
+			vk_buffer.drawMeshTasksEXT(1, 1, 1);
+			MeshIndirectObserve(MeshIndirectEvent::Submit);
+		} else {
+			vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
+		}
 	} else {
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit,
 		                   indirect_buffer != nullptr ? indirect_buffer->Handle() : nullptr,
 		                   indirect_offset);
+	}
+	if (gpu_draw_sample) {
+		m_context.GetCommandScheduler().EndGpuDrawSample(buffer);
 	}
 
 	if (!draw.IsIndexed()) {
@@ -1373,11 +1487,13 @@ void RenderExecutor::ExecutePreparedDrawResolved(uint64_t submit_id, CommandBuff
 	}
 	vk::PipelineStageFlags shader_write_stages = {};
 	for (const auto& stage: vertex_stages) {
-		if (HasShaderBufferWrites(stage.stage)) {
+		if (HasShaderBufferWrites(stage.stage) ||
+		    (m_context.GetGraphics().task_shader_enabled && stage.stage.program->has_address_writes)) {
 			shader_write_stages |= ShaderPipelineStages(NativeShaderStage(stage.logical_stage));
 		}
 	}
-	if (state.ps_active && HasShaderBufferWrites(state.ps_input_info.stage)) {
+	if (state.ps_active && (HasShaderBufferWrites(state.ps_input_info.stage) ||
+	    (m_context.GetGraphics().task_shader_enabled && state.ps_input_info.stage.program->has_address_writes))) {
 		shader_write_stages |= vk::PipelineStageFlagBits::eFragmentShader;
 	}
 	if (shader_write_stages) {

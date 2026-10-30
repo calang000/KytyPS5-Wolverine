@@ -63,6 +63,14 @@ public:
 	void dispatchIndirect(vk::Buffer buffer, vk::DeviceSize offset) const {
 		Run([=](vk::CommandBuffer command) { command.dispatchIndirect(buffer, offset); });
 	}
+	void setFragmentShadingRateKHR(vk::Extent2D fragment_size) const {
+		Run([=](vk::CommandBuffer command) {
+			const vk::FragmentShadingRateCombinerOpKHR combiners[2] {
+			    vk::FragmentShadingRateCombinerOpKHR::eKeep,
+			    vk::FragmentShadingRateCombinerOpKHR::eKeep};
+			command.setFragmentShadingRateKHR(fragment_size, combiners);
+		});
+	}
 	void bindIndexBuffer(vk::Buffer buffer, vk::DeviceSize offset, vk::IndexType type) const {
 		Run([=](vk::CommandBuffer command) { command.bindIndexBuffer(buffer, offset, type); });
 	}

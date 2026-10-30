@@ -42,6 +42,7 @@ struct PipelineStaticParameters {
 	bool                       depth_clip_enable        = true;
 	vk::PrimitiveTopology      topology                 = vk::PrimitiveTopology::ePointList;
 	bool                       primitive_restart_enable = false;
+	bool                       mesh_task_indirect = false;
 	uint32_t                   samples                  = 1;
 	bool                       sample_shading_enable    = false;
 	bool                       depth_bounds_test_enable = false;
@@ -70,7 +71,7 @@ struct PipelineStaticParameters {
 static_assert(std::is_trivially_copyable_v<PipelineStaticParameters>);
 static_assert(std::is_standard_layout_v<PipelineStaticParameters>);
 static_assert(alignof(PipelineStaticParameters) == 1);
-static_assert(sizeof(PipelineStaticParameters) == 125);
+static_assert(sizeof(PipelineStaticParameters) == 126);
 
 struct PipelineRenderingState {
 	std::array<vk::Format, RENDER_COLOR_ATTACHMENTS_MAX> color_formats {};
@@ -119,6 +120,13 @@ struct GraphicsPipelineBuild {
 	vk::Device                                                            device;
 	vk::ShaderModule                                                      tess_control = nullptr;
 	vk::ShaderModule                                                      tess_eval    = nullptr;
+	vk::ShaderModule                                                      task_shader = nullptr;
+	std::array<uint32_t, 6> task_constants {};
+	std::array<vk::SpecializationMapEntry, 6> task_entries {};
+	vk::SpecializationInfo task_specialization {};
+	uint32_t mesh_uses_task_payload = 0;
+	vk::SpecializationMapEntry mesh_task_entry {};
+	vk::SpecializationInfo mesh_task_specialization {};
 	std::array<vk::PipelineShaderStageCreateInfo, 4>                      stages {};
 	std::array<vk::VertexInputAttributeDescription, ShaderVertexInputInfo::RES_MAX> input_attr {};
 	std::array<vk::VertexInputBindingDescription, ShaderVertexInputInfo::RES_MAX>   input_desc {};
@@ -164,6 +172,7 @@ public:
 		bool                    uses_push_descriptors = false;
 		// Samples bindless images: descriptor set 1 is the bindless table.
 		bool                    uses_bindless         = false;
+		uint32_t                samples               = 1;
 		// Set while a worker compiles `pipeline`; draws skip it until the compile finishes.
 		std::shared_ptr<PendingGraphicsPipeline> pending;
 	};
@@ -200,7 +209,7 @@ public:
 	                                 CommandBuffer&                         command,
 	                                 const ShaderPixelInputInfo*            ps_input_info,
 	                                 vk::PrimitiveTopology topology, bool primitive_restart_enable,
-	                                 const GraphicsPrograms& programs, bool may_defer);
+	                                 const GraphicsPrograms& programs, bool may_defer, bool mesh_task_indirect = false);
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	                             const ShaderProgram&          compute_program);
 

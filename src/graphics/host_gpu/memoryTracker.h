@@ -50,7 +50,8 @@ public:
 	}
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
-	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
+	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush,
+	                      uint32_t clean_write_cluster_pages = 0) noexcept {
 		static_assert(std::is_invocable_v<Flush&>);
 		CheckNotInUploadCallback();
 
@@ -67,7 +68,28 @@ public:
 				if (manager->IsModified<DirtySource::Gpu>(offset, bytes)) {
 					return true;
 				}
-				manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
+				// Only faulting single-byte writes may conservatively dirty neighbours. Keep
+				// the GPU ownership check and the entire expansion under this region lock:
+				// a preflight check outside it could overwrite newer GPU data on upload.
+				uint64_t dirty_offset = offset;
+				uint64_t dirty_bytes = bytes;
+				if (size == 1 && clean_write_cluster_pages > 1 &&
+				    clean_write_cluster_pages <= TRACKER_REGION_PAGES &&
+				    std::has_single_bit(clean_write_cluster_pages)) {
+					const auto page = offset / TRACKER_PAGE_SIZE;
+					const auto cluster_first = page & ~(uint64_t(clean_write_cluster_pages) - 1);
+					const auto cluster_last = cluster_first + clean_write_cluster_pages;
+					auto first = page;
+					auto last = page + 1;
+					while (first > cluster_first && !manager->IsModified<DirtySource::Gpu>(
+					           (first - 1) * TRACKER_PAGE_SIZE, TRACKER_PAGE_SIZE)) --first;
+					while (last < cluster_last && !manager->IsModified<DirtySource::Gpu>(
+					           last * TRACKER_PAGE_SIZE, TRACKER_PAGE_SIZE)) ++last;
+					dirty_offset = first * TRACKER_PAGE_SIZE;
+					dirty_bytes = (last - first) * TRACKER_PAGE_SIZE;
+				}
+				manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + dirty_offset,
+				                                               dirty_bytes);
 				return false;
 			}();
 			if (should_flush) {
@@ -105,7 +127,8 @@ public:
 		static_assert(std::is_nothrow_invocable_v<RangeFunc&, uint64_t, uint64_t>);
 		static_assert(std::is_nothrow_invocable_v<UploadFunc&>);
 		CheckNotInUploadCallback();
-		Iterate<true>(vaddr, size, [](RegionManager*, uint64_t, uint64_t) {});
+		if (size > TRACKER_REGION_SIZE * 2u && UseRegionInitBitmap()) EnsureRegions(vaddr, size);
+		else Iterate<true>(vaddr, size, [](RegionManager*, uint64_t, uint64_t) {});
 		const auto* previous_upload_owner = std::exchange(s_upload_owner, this);
 		const auto  upload_region = [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
             manager->lock.lock();
@@ -155,6 +178,8 @@ private:
 	// to read its CPU summary, a cache miss per 4 MiB. Each manager mirrors that summary into
 	// m_cpu_summary_bits, so the walk reads a bitmap word per 256 MiB instead.
 	static bool UseRegionBitmap();
+	static bool UseRegionInitBitmap();
+	void EnsureRegions(uint64_t vaddr, uint64_t size);
 
 	// Calls func(manager, offset, bytes) for each existing region of the range whose CPU summary
 	// bit is set (conservative like the summary itself).
@@ -232,6 +257,9 @@ private:
 
 	std::unique_ptr<std::atomic<RegionManager*>[]> m_regions;
 	std::unique_ptr<std::atomic<uint64_t>[]>       m_cpu_summary_bits;
+	// Monotonic: a region is never destroyed before the tracker. A set bit publishes both
+	// its pointer and initial CPU summary, so large clean bindings need no per-region probe.
+	std::unique_ptr<std::atomic<uint64_t>[]>       m_region_presence_bits;
 	std::vector<std::unique_ptr<RegionManager>>    m_region_storage;
 	std::mutex                                     m_region_mutex;
 	PageManager&                                   m_page_manager;

@@ -39,8 +39,8 @@ namespace {
 constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
 
-// KYTY_READBACK_STATS=1: every 5 s, print the buffers whose guest page faults were handed to the
-// GPU thread (BufferCache::ReadMemory) and how each one ended. For downloads it also reports the
+// KYTY_READBACK_STATS=1: every 5 s, print the buffers read back on the GPU thread
+// (BufferCache::ReadMemory) and how each request ended. For downloads it also reports the
 // written binding that last marked the faulting bytes (shader, size, whether that GPU work had
 // already finished, how long ago it was bound) and how many downloaded bytes differed from guest
 // memory. Only the GPU thread records, except the byte comparison (download completions).
@@ -170,6 +170,12 @@ private:
 		auto& entry = m_entries[buffer_begin];
 		entry.size  = buffer_size;
 		(is_write ? entry.writes : entry.reads)++;
+		// Keep all four callers separate, including entries outside the printed top eight.
+		// BeginWriteReadback times only its submission; these are GPU-owner scope times,
+		// not the guest's end-to-end latency or an FPS measurement.
+		const auto caller = (s_forwarded ? 2u : 0u) + (is_write ? 1u : 0u);
+		entry.caller_count[caller]++;
+		entry.caller_micros[caller] += micros;
 		if (s_forwarded) {
 			entry.forwarded++;
 			entry.forwarded_micros += micros;
@@ -197,9 +203,15 @@ private:
 	void Print() const {
 		std::vector<std::pair<uint64_t, const Entry*>> sorted;
 		double                                         total = 0;
+		std::array<uint64_t, 4> caller_count {};
+		std::array<double, 4> caller_micros {};
 		for (const auto& [begin, entry]: m_entries) {
 			sorted.emplace_back(begin, &entry);
 			total += entry.micros;
+			for (size_t caller = 0; caller < caller_count.size(); ++caller) {
+				caller_count[caller] += entry.caller_count[caller];
+				caller_micros[caller] += entry.caller_micros[caller];
+			}
 		}
 		std::ranges::sort(sorted, [](const auto& a, const auto& b) {
 			return a.second->micros > b.second->micros;
@@ -209,6 +221,12 @@ private:
 		::printf("Readback stats (5 s): %zu buffers, %.1f ms on the GPU thread; downloads changed "
 		         "%" PRIu64 " of %" PRIu64 " KiB of guest memory\n",
 		         sorted.size(), total / 1000.0, changed / 1024, compared / 1024);
+		static constexpr std::array<const char*, 4> caller_names {
+		    "owner-read", "owner-write", "guest-read", "guest-write"};
+		for (size_t caller = 0; caller < caller_count.size(); ++caller) {
+			::printf("  caller %s: count %" PRIu64 ", %.3f ms GPU-owner scopes\n",
+			         caller_names[caller], caller_count[caller], caller_micros[caller] / 1000.0);
+		}
 		for (size_t i = 0; i < std::min<size_t>(sorted.size(), 8); i++) {
 			const auto& [begin, e] = sorted[i];
 			::printf("  buffer 0x%016" PRIx64 " size %" PRIu64 " KiB: writes %" PRIu64
@@ -254,6 +272,8 @@ private:
 		uint64_t                               size   = 0;
 		uint64_t                               writes = 0;
 		uint64_t                               reads  = 0;
+		std::array<uint64_t, 4>                 caller_count {};
+		std::array<double, 4>                   caller_micros {};
 		uint64_t                               outcomes[OutcomeCount] {};
 		uint64_t                               download_bytes = 0;
 		double                                 micros         = 0;
@@ -742,6 +762,27 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
 }
 
+void BufferCache::InvalidateCpuWriteFault(uint64_t vaddr) {
+	// Live, default off: 1 = 16 KiB, 2 = 64 KiB, 3 = 256 KiB. This changes
+	// buffer dirty tracking only. Texture watchers still fault on actual writes.
+	static auto& setting = Common::LiveSwitches::Get("KYTY_WRITE_FAULT_CLUSTER", 0);
+	const auto mode = setting.load(std::memory_order_relaxed);
+	const uint32_t pages = mode >= 1 && mode <= 3 ? (1u << (2 * mode)) : 0;
+	if (!GuestRange {vaddr, 1}.Valid()) EXIT("invalid CPU write fault\n");
+	m_memory_tracker.InvalidateRegion(vaddr, 1, [this, vaddr] { ReadMemory(vaddr, 1, true); },
+	                                  pages);
+}
+
+uint64_t BufferCache::CachedDeviceAddress(uint64_t vaddr, uint64_t size) const noexcept {
+	if (!GuestRange {vaddr, size}.Valid()) return 0;
+	const auto* id = m_page_table.Find(vaddr >> PageTable::kPageBits);
+	if (id == nullptr || !*id) return 0;
+	const auto* buffer = m_slot_buffers.try_get(*id);
+	if (buffer == nullptr || buffer->is_deleted || !buffer->HasDeviceAddress() ||
+	    !buffer->IsInBounds(vaddr, size)) return 0;
+	return buffer->BufferDeviceAddress() + buffer->Offset(vaddr);
+}
+
 bool BufferCache::WriteClean(uint64_t vaddr, const void* data, uint64_t size) {
 	if (!GuestGpu::IsGpuThread() || size == 0 || !GuestRange {vaddr, size}.Valid() ||
 	    !m_memory_tracker.IsRegionGpuModified(vaddr, size)) {
@@ -783,9 +824,9 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	// download and submits it; the faulting guest thread waits for that submission, and a second
 	// command lifts the window's GPU ownership, or resolves the fault synchronously if the GPU
 	// wrote there again in the meantime.
-	// KYTY_ASYNC_READBACK=1 (live, default 0) does the same for guest reads. Wolverine run 36
-	// (KYTY_READBACK_STATS): every readback at the spot came from a guest thread, and serving
-	// them synchronously cost the GPU thread ~1.3 s per 5 s, mostly waiting for the GPU.
+	// KYTY_ASYNC_READBACK=1 does the same for guest reads. GPU-owner shader reads must
+	// stay synchronous; classifying them as forwarded faults would overstate the work
+	// that this path can move off the owner.
 	if (!GuestGpu::IsGpuThread() && !Libs::LibKernel::Memory::ForceSyncReadback() &&
 	    (is_write ? AsyncWriteReadbackEnabled() : AsyncReadReadbackEnabled())) {
 		uint64_t tick         = 0;
@@ -817,10 +858,14 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		}
 		return;
 	}
-	gpu.SendCommandSync([this, vaddr, size, is_write] {
-		ReadbackStats::s_forwarded = true;
+	// SendCommandSync also executes inline on the GPU owner. Determine the caller
+	// before dispatch; otherwise owner-side shader reads are mislabeled guest faults.
+	const bool forwarded = !GuestGpu::IsGpuThread();
+	gpu.SendCommandSync([this, vaddr, size, is_write, forwarded] {
+		const bool previous = ReadbackStats::s_forwarded;
+		ReadbackStats::s_forwarded = forwarded;
 		ReadMemoryOnGpu(vaddr, size, is_write);
-		ReadbackStats::s_forwarded = false;
+		ReadbackStats::s_forwarded = previous;
 	});
 }
 

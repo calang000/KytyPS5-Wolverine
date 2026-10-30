@@ -9,6 +9,7 @@
 #include <span>
 #include <unordered_map>
 #include <vector>
+#include <optional>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
@@ -30,6 +31,20 @@ struct SrtRuntime {
 	// indirect dispatch) and workgroup size bound the invocation IDs in buffer write extents.
 	std::array<uint32_t, 3>   workgroup_count            = {};
 	std::array<uint32_t, 3>   workgroup_size             = {};
+	// One session per concurrent evaluation; initialize the plan's compiled/native code on the
+	// owning thread before sharing it. Null retains the default serial session in ResourcePlan.
+	ResourceEvaluationSession* evaluation_session = nullptr;
+	const SrtReadSpan* fast_read = nullptr;
+	const SrtReadSpan* fast_specialization_read = nullptr;
+	// Opt-in for readers whose published spans remain valid throughout this evaluation.
+	// Capturing wrappers still record every successful logical read, including span hits.
+	bool capture_read_spans = false;
+	bool capture_bulk_reads = false;
+	// Internal capturing wrapper: bulk reads may use the authorized page only when
+	// they append every uncached logical read to the proof. Scalar JIT spans stay off.
+	const SrtReadSpan* captured_bulk_read = nullptr;
+	const SrtReadSpan* captured_bulk_specialization_read = nullptr;
+	std::vector<std::pair<uint64_t, uint64_t>>* captured_reads = nullptr;
 };
 
 enum class RuntimeValueType { Any, Integer };
@@ -59,6 +74,10 @@ bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
 // Uses the strict reader for values that affect shader specialization.
 SrtRuntime CleanRuntime(SrtRuntime runtime);
 
+// Owning-thread initialization before a plan is shared with explicit worker sessions.
+// Returns false when the native path cannot be prepared; that plan must remain serial.
+bool PrepareResourceEvaluation(const ResourcePlan& program);
+
 // One memoized evaluation session shared by the entire shader resource refresh.
 class SrtWalker {
 public:
@@ -71,6 +90,9 @@ public:
 
 	bool Evaluate(Value value, uint32_t& result);
 	bool EvaluateDescriptor(uint32_t source, DescriptorValue& result);
+	// nullopt: not eligible; otherwise the successful prefix. On failure the next
+	// descriptor must take the ordinary failure path without re-reading guest memory.
+	std::optional<size_t> EvaluateReadonlyBufferGroup(std::span<DescriptorValue> output);
 	// Refreshes reachable scalar reads and active descriptor sources in one walk.
 	bool RefreshFlatBuffer(std::vector<uint32_t>& flat);
 
@@ -85,7 +107,8 @@ private:
 	bool EvaluateNative(const SrtNativeValue& value, uint64_t& result);
 	[[nodiscard]] bool UseNativeTables() const;
 
-	static ResourcePlan::EvaluationContext& AcquireContext(const ResourcePlan& program);
+	static ResourceEvaluationSession& SelectSession(const ResourcePlan& program, ResourceEvaluationSession* explicit_session);
+	static ResourcePlan::EvaluationContext& AcquireContext(ResourceEvaluationSession& session);
 	static float Float32(uint64_t bits);
 	bool EvaluateWide(Value value, uint64_t& result);
 	// KYTY_SRT_COMPILED: evaluates a compiled node (the IR value `value` for the comparison mode).
@@ -108,6 +131,7 @@ private:
 	SrtWalker*                      m_clean_evaluator = nullptr;
 	Value                           m_active_mask;
 	const Inst*                     m_failed_value = nullptr;
+	ResourceEvaluationSession& m_session;
 	ResourcePlan::EvaluationContext& m_context;
 	// KYTY_SRT_COMPILED: the plan's compiled form (null: walk the IR), the node being evaluated,
 	// and whether every root is evaluated both ways and compared (mode 2).

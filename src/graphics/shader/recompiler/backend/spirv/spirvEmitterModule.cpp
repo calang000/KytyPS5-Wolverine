@@ -208,7 +208,16 @@ bool DispatchDimensionsIndirect(const EmitterState& state) {
 }
 
 bool UsesPhysicalAddresses(const EmitterState& state) {
-	return state.program.info.uses_dma || DispatchDimensionsIndirect(state);
+	return state.program.info.uses_dma || DispatchDimensionsIndirect(state) ||
+	       MeshIndirectParameters(state);
+}
+
+bool MeshIndirectParameters(const EmitterState& state) {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_MESH_TASK_INDIRECT");
+		return value != nullptr && std::atoi(value) != 0;
+	}();
+	return enabled && state.program.stage == ShaderType::Mesh;
 }
 
 uint32_t TypePhysicalU32Pointer(EmitterState& state) {
@@ -363,6 +372,17 @@ void DefineBindlessImages(EmitterState& state) {
 }
 
 void DefineDescriptors(EmitterState& state) {
+	if (MeshIndirectParameters(state)) {
+		const auto type = state.builder.Type(spv::OpTypeStruct, TypeU32(state), TypeU32(state), TypeU32(state));
+		state.task_payload_variable = state.builder.DefineGlobalVariable(
+		    TypePointer(state, spv::StorageClassTaskPayloadWorkgroupEXT, type), spv::StorageClassTaskPayloadWorkgroupEXT);
+		state.interface_variables.push_back(state.task_payload_variable);
+		state.builder.AddName(state.task_payload_variable, "mesh_draw_task_payload");
+		state.task_payload_enabled = state.builder.Constant(spv::OpSpecConstantFalse, TypeBool(state));
+		state.builder.AddAnnotation(spv::OpDecorate, state.task_payload_enabled,
+		    spv::DecorationSpecId, IR::PushData::MeshTaskSpecializationId);
+		state.builder.AddName(state.task_payload_enabled, "mesh_uses_task_payload");
+	}
 	DefineBindlessImages(state);
 	if (state.program.bindings.UsesPushData() || state.program.stage == ShaderType::Mesh) {
 		const auto type              = PushConstantBlockType(state);

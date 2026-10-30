@@ -322,6 +322,12 @@ static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 55u);
 struct PushData {
 	static constexpr uint32_t DwordCount = 32;
 	static constexpr uint32_t MeshDrawDwordCount = 6;
+	// Optional task ABI: dwords4/5 contain the argument BDA. The task snapshots
+	// count/offsets into its payload. Normal index sizes0/1/2/4 never set this bit.
+	static constexpr uint32_t MeshIndirectTag = 0x80000000u;
+	// Mesh-stage specialization ID, independent of task-stage IDs.
+	static constexpr uint32_t MeshTaskSpecializationId = 0;
+	static constexpr uint32_t MeshTaskBackendVersion = 2;
 	static constexpr uint32_t NoStart    = UINT32_MAX;
 	std::array<uint32_t, DwordCount> dwords {};
 
@@ -593,7 +599,8 @@ struct CompiledSrt;
 // condition and fill values without translated blocks, plus reusable evaluation scratch.
 class SrtNativeCode;
 
-struct ResourcePlan {
+struct ResourcePlan;
+struct ResourceEvaluationSession {
 	struct EvaluationContext {
 		struct Entry {
 			uint64_t value      = 0;
@@ -603,8 +610,25 @@ struct ResourcePlan {
 		std::vector<Entry> values;
 		// The same memo, indexed by CompiledSrt node.
 		std::vector<Entry> node_values;
+		struct BufferView {
+			uint64_t base = 0, size = 0, generation = 0;
+		};
+		std::vector<BufferView> buffer_views;
 		uint64_t           generation = 0;
 	};
+
+	const ResourcePlan* owner = nullptr;
+	std::deque<EvaluationContext> evaluation_contexts;
+	uint32_t evaluation_depth = 0;
+	std::vector<uint8_t> active_sources, active_initial, visited_blocks;
+	std::vector<uint32_t> pending_blocks, material_keys;
+	std::vector<std::pair<uint32_t, uint8_t>> active_walk;
+	std::vector<uint8_t> active_walk_result;
+	bool active_walk_valid = false;
+};
+
+struct ResourcePlan {
+	using EvaluationContext = ResourceEvaluationSession::EvaluationContext;
 
 	ResourcePlan() = default;
 	~ResourcePlan();
@@ -627,6 +651,9 @@ struct ResourcePlan {
 	std::vector<uint8_t>                buffer_writes_bounded;
 	std::vector<BufferWrite>            buffer_writes;
 	std::vector<uint8_t>                clean_flat_slots;
+	// Empty preserves the original eager refresh. Otherwise only marked slots are uploaded
+	// shader values; host-only descriptor expressions are evaluated lazily by SrtWalker.
+	std::vector<uint8_t>                gpu_flat_slots;
 	bool                                requires_specialization_memory = false;
 	bool                                capture_specialization_reads = false;
 	// A descriptor phi was lowered to a host selection in a shader that writes memory: the
@@ -640,28 +667,24 @@ struct ResourcePlan {
 	bool                                resource_tracking_complete = false;
 	ShaderInfo                          info;
 	UniformFillPlan                     uniform_fill;
-	// GPU-thread scratch for nested clean/EXEC memos, activity and material keys.
-	mutable std::deque<EvaluationContext> evaluation_contexts;
-	mutable uint32_t                       evaluation_value_count = 0;
-	mutable uint32_t                       evaluation_depth       = 0;
-	mutable std::vector<uint8_t>            active_sources;
-	// active_sources before the walk (sources no block guards), built once per plan.
-	mutable std::vector<uint8_t>            active_initial;
-	mutable std::vector<uint8_t>            visited_blocks;
-	mutable std::vector<uint32_t>           pending_blocks;
-	mutable std::vector<uint32_t>           material_keys;
+	// Default serial session. Explicit runtime sessions isolate mutable scratch for workers.
+	mutable ResourceEvaluationSession evaluation_session;
+	mutable uint32_t evaluation_value_count = 0;
 	// Built on first use by SrtWalker when KYTY_SRT_COMPILED is on; null if the plan cannot be
 	// compiled. Its nodes point into value_storage, which a move keeps in place.
 	mutable std::shared_ptr<const CompiledSrt> compiled_srt;
 	mutable bool                               compiled_srt_tried = false;
-	// The plan compiled into x86-64 code (SrtNative.h) once it is refreshed often enough.
-	// FindActiveSources' last walk: the blocks it visited in order with their condition outcomes
-	// (0 false, 1 true, 2 not evaluated), and its result. A walk whose conditions give the same
-	// outcomes is the same walk.
-	mutable std::vector<std::pair<uint32_t, uint8_t>> active_walk;
-	mutable std::vector<uint8_t>                      active_walk_result;
-	mutable bool                                      active_walk_valid = false;
+	// Prepared on the owning thread before concurrent sessions may evaluate this plan.
 	mutable std::shared_ptr<const SrtNativeCode> native_code;
+	// Optional owning-thread-only code variant for live comparison of value aliases.
+	mutable std::shared_ptr<const SrtNativeCode> native_alias_code;
+	mutable bool native_alias_attempted = false;
+	mutable std::shared_ptr<const SrtNativeCode> native_canonical_code;
+	mutable bool native_canonical_attempted = false;
+	// Owner-only eager batch for a masked plan with lazy refresh disabled. This
+	// keeps an eager/lazy comparison on the same native batching implementation.
+	mutable std::shared_ptr<const SrtNativeCode> native_eager_canonical_code;
+	mutable bool native_eager_canonical_attempted = false;
 	mutable uint32_t                             native_uses      = 0;
 	mutable bool                                 native_attempted = false;
 };

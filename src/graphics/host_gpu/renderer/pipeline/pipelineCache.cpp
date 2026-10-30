@@ -14,6 +14,8 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
 #include "graphics/host_gpu/renderer/pipeline/programDiskCache.h"
+#include "graphics/host_gpu/renderer/pipeline/resourceReplay.h"
+#include "graphics/host_gpu/renderer/pipeline/resourceWorker.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
@@ -187,18 +189,51 @@ bool UsesShaderClock(const ShaderRecompiler::IR::Program& program) {
 // per-read path, so the values are the ones read before. Nothing marks a page GPU-written during
 // one synchronous lookup on the GPU thread; the verdicts live for one lookup only.
 // The same object can log every read and its result (KYTY_RESOURCE_MEMO, ProgramCache).
+class ResourceCpuTimer {
+public:
+	ResourceCpuTimer() {
+		static auto& enabled = Common::LiveSwitches::Get("KYTY_RESOURCE_CPU_STATS", 0);
+		m_enabled = enabled.load(std::memory_order_relaxed) != 0;
+		if (m_enabled) m_start = std::chrono::steady_clock::now();
+	}
+	~ResourceCpuTimer() {
+		if (!m_enabled) return;
+		const auto now = std::chrono::steady_clock::now();
+		static auto& batch = Common::LiveSwitches::Get("KYTY_SRT_NATIVE_BATCH", 0);
+		static auto& lazy = Common::LiveSwitches::Get("KYTY_LAZY_SRT_REFRESH", 1);
+		static auto& direct = Common::LiveSwitches::Get("KYTY_SRT_DIRECT_READ", 0);
+		static auto& views = Common::LiveSwitches::Get("KYTY_SRT_BUFFER_VIEWS", 0);
+		static auto& bulk = Common::LiveSwitches::Get("KYTY_SRT_BULK_READS", 0);
+		static auto& aliases = Common::LiveSwitches::Get("KYTY_SRT_VALUE_ALIASES", 0);
+		const int mode = int(batch.load(std::memory_order_relaxed) != 0) |
+		                 (int(lazy.load(std::memory_order_relaxed) != 0) << 1) |
+		                 (int(direct.load(std::memory_order_relaxed) != 0) << 2) |
+		                 (int(views.load(std::memory_order_relaxed) != 0) << 3) |
+		                 (int(bulk.load(std::memory_order_relaxed) != 0) << 4) |
+		                 (int(aliases.load(std::memory_order_relaxed) != 0) << 5);
+		// This scope runs on the command thread. Start a fresh window after a live mode change.
+		static int previous = -1;
+		static auto report = now;
+		static double micros = 0;
+		static uint64_t calls = 0;
+		if (previous != mode) { previous = mode; report = now; micros = 0; calls = 0; }
+		micros += std::chrono::duration<double, std::micro>(now - m_start).count();
+		++calls;
+		if (now - report >= std::chrono::seconds(5)) {
+			std::printf("Resource CPU: batch=%d lazy=%d direct=%d views=%d bulk=%d aliases=%d calls=%" PRIu64 " total_ms=%.3f mean_us=%.4f\n",
+			            mode & 1, (mode >> 1) & 1, (mode >> 2) & 1, (mode >> 3) & 1, (mode >> 4) & 1, (mode >> 5) & 1,
+			            calls, micros / 1000.0, micros / calls);
+			report = now; micros = 0; calls = 0;
+		}
+	}
+private:
+	bool m_enabled = false;
+	std::chrono::steady_clock::time_point m_start;
+};
+
 class ShaderReadChunks {
 public:
-	struct LoggedRead {
-		uint64_t address = 0;
-		uint32_t first   = 0; // index of the first word in ReadLog::words
-		uint32_t count   = 0;
-		bool     ok      = false;
-	};
-	struct ReadLog {
-		std::vector<LoggedRead> reads;
-		std::vector<uint32_t>   words;
-	};
+	using ReadLog = ResourceReplay::ReadLog;
 
 	explicit ShaderReadChunks(int64_t mode): m_chunks(mode == 1), m_pages(mode == 2) {}
 
@@ -229,7 +264,8 @@ public:
 		return true;
 	}
 
-	void SetLog(ReadLog* log) { m_log = log; }
+	void SetLog(ReadLog* log) { m_log = log; m_fast = {}; }
+	const ShaderRecompiler::IR::SrtReadSpan* FastRead() const { return m_pages ? &m_fast : nullptr; }
 
 	void Log(uint64_t address, std::span<const uint32_t> values, bool ok) {
 		if (m_log == nullptr) {
@@ -287,8 +323,10 @@ private:
 			page       = &slot;
 		}
 		if (page->backing == nullptr) {
+			m_fast = {};
 			return false;
 		}
+		if (m_log == nullptr) m_fast = {base, page->backing, TRACKER_PAGE_SIZE - sizeof(uint32_t)};
 		std::memcpy(values.data(), page->backing + (address - base), values.size_bytes());
 		return true;
 	}
@@ -305,6 +343,7 @@ private:
 	bool                 m_chunks = false;
 	bool                 m_pages  = false;
 	ReadLog*             m_log    = nullptr;
+	ShaderRecompiler::IR::SrtReadSpan m_fast;
 	std::array<Slot, 8>  m_slots;
 	size_t               m_next = 0;
 	std::array<Page, 16> m_pages_cache;
@@ -506,6 +545,11 @@ private:
 // KYTY_RESOURCE_MEMO=1 (a live switch, off by default): see ProgramCache::Materialize.
 bool ResourceMemoEnabled() {
 	static auto& enabled = Common::LiveSwitches::Get("KYTY_RESOURCE_MEMO", 0);
+	return enabled.load(std::memory_order_relaxed) != 0;
+}
+
+bool ResourceMemoRelevantInputs() {
+	static auto& enabled = Common::LiveSwitches::Get("KYTY_RESOURCE_MEMO_RELEVANT", 0);
 	return enabled.load(std::memory_order_relaxed) != 0;
 }
 
@@ -974,7 +1018,10 @@ struct PipelineCache::ProgramCache {
 	// KYTY_RESOURCE_MEMO: the inputs and results of a recent MaterializeResources call.
 	struct MemoSlot {
 		std::vector<uint32_t>                        user_data;
+		uint32_t                                     user_data_count = 0;
+		bool                                         relevant_inputs = false;
 		uint64_t                                     shader_base = 0;
+		bool                                         float_image_atomics = true;
 		// Compute dispatch size: bounds the written extent of each written buffer.
 		std::array<uint32_t, 3>                      workgroup_count {};
 		std::array<uint32_t, 3>                      workgroup_size {};
@@ -987,6 +1034,26 @@ struct PipelineCache::ProgramCache {
 		explicit SourceEntry(ShaderRecompiler::IR::ResourcePlan plan)
 		    : resource_plan(std::move(plan)) {
 			permutations.reserve(8);
+			for (const auto& inst: resource_plan.value_storage) {
+				if (inst.GetOpcode() != ShaderRecompiler::IR::ValueOpcode::GetUserData) {
+					continue;
+				}
+				if (inst.NumArgs() != 1 ||
+				    inst.Arg(0).GetType() != ShaderRecompiler::IR::Type::ScalarReg) {
+					relevant_inputs_valid = false;
+					break;
+				}
+				const auto reg = ShaderRecompiler::IR::RegIndex(inst.Arg(0).ScalarRegister());
+				if (reg < resource_plan.user_data_base ||
+				    reg - resource_plan.user_data_base >= resource_plan.user_data_count) {
+					relevant_inputs_valid = false;
+					break;
+				}
+				relevant_inputs.push_back(reg - resource_plan.user_data_base);
+			}
+			std::ranges::sort(relevant_inputs);
+			relevant_inputs.erase(
+			    std::unique(relevant_inputs.begin(), relevant_inputs.end()), relevant_inputs.end());
 		}
 
 		ShaderRecompiler::IR::ResourcePlan           resource_plan;
@@ -994,6 +1061,14 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		std::vector<Permutation>                    permutations;
 		std::vector<MemoSlot>                        memo;
+		std::vector<uint32_t>                        relevant_inputs;
+		bool                                         relevant_inputs_valid = true;
+		bool                                         replay_capture_attempted = false;
+		bool worker_requested = false;
+		bool worker_prepared = false;
+		bool worker_prepare_tried = false;
+		std::vector<uint64_t> worker_pages;
+		ShaderRecompiler::IR::ResourceEvaluationSession worker_session;
 		// KYTY_ASYNC_SHADERS: permutations a worker is compiling.
 		std::vector<std::shared_ptr<AsyncPermutationJob>> pending;
 	};
@@ -1006,18 +1081,98 @@ struct PipelineCache::ProgramCache {
 	// stored result instead of evaluating the resource plan again.
 	bool Materialize(SourceEntry& entry, const ShaderRecompiler::IR::SrtRuntime& runtime,
 	                 ShaderReadChunks& reads) {
+		// Discover the memory footprint on the owning thread. Subsequent speculative jobs use
+		// fresh copies of these pages; a new address always forces serial re-evaluation.
+		if (entry.worker_requested && ResourceWorkerEnabled()) {
+			ResourceCpuTimer timer;
+			ShaderReadChunks::ReadLog log;
+			reads.SetLog(&log);
+			const bool ok = ShaderRecompiler::IR::MaterializeResources(
+			    entry.resource_plan, runtime, entry.resources, entry.specialization);
+			reads.SetLog(nullptr);
+			entry.worker_pages.clear();
+			if (ok) {
+				for (const auto& read: log.reads) {
+					if (!read.ok || read.count == 0 || read.address > UINT64_MAX - uint64_t(read.count) * 4) continue;
+					const auto last = (read.address + uint64_t(read.count) * 4 - 1) & ~uint64_t(4095);
+					for (auto page = read.address & ~uint64_t(4095);; page += 4096) {
+						entry.worker_pages.push_back(page);
+						if (page == last) break;
+					}
+				}
+				std::ranges::sort(entry.worker_pages);
+				const auto duplicates = std::ranges::unique(entry.worker_pages);
+				entry.worker_pages.erase(duplicates.begin(), duplicates.end());
+			}
+			return ok;
+		}
+		ResourceCpuTimer timer;
+		// Capture a bounded set of real resource workloads for deterministic CPU experiments.
+		// Enabled live only after the game has loaded; the ordinary renderer pays no logging cost.
+		static auto& capture_enabled = Common::LiveSwitches::Get("KYTY_RESOURCE_CAPTURE", 0);
+		static uint32_t captures = 0;
+		if (capture_enabled.load(std::memory_order_relaxed) != 0 &&
+		    !entry.replay_capture_attempted && captures < 128) {
+			entry.replay_capture_attempted = true;
+			ResourceReplay::Capture capture;
+			reads.SetLog(&capture.log);
+			const bool ok = ShaderRecompiler::IR::MaterializeResources(
+			    entry.resource_plan, runtime, entry.resources, entry.specialization);
+			reads.SetLog(nullptr);
+			if (ok && ProgramDiskCache::SerializePlan(entry.resource_plan, capture.plan)) {
+				capture.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
+				capture.shader_base = runtime.shader_base;
+				capture.workgroup_count = runtime.workgroup_count;
+				capture.workgroup_size = runtime.workgroup_size;
+				capture.float_image_atomics = runtime.float_image_atomics;
+				const char* directory = std::getenv("KYTY_RESOURCE_CAPTURE_DIR");
+				const auto dir = std::filesystem::path(directory != nullptr ? directory : "_ResourceReplay");
+				std::error_code error;
+				std::filesystem::create_directories(dir, error);
+				const auto path = dir / fmt::format("{:03}-{:016x}.srt-replay", captures++,
+				                                    entry.resource_plan.shader_hash);
+				const bool saved = !error && ResourceReplay::Write(path, capture);
+				std::printf("Resource replay: %s %s (%zu reads, %zu plan bytes)\n",
+				            saved ? "saved" : "failed", path.string().c_str(),
+				            capture.log.reads.size(), capture.plan.size());
+			}
+			return ok;
+		}
 		if (!ResourceMemoEnabled()) {
 			return ShaderRecompiler::IR::MaterializeResources(
 			    entry.resource_plan, runtime, entry.resources, entry.specialization);
 		}
 		memo_clock++;
+		const bool relevant = ResourceMemoRelevantInputs() && entry.relevant_inputs_valid;
+		const auto inputs_match = [&](const MemoSlot& slot) {
+			if (slot.user_data_count != runtime.user_data.size() ||
+			    slot.relevant_inputs != relevant) {
+				return false;
+			}
+			if (!relevant) {
+				return std::ranges::equal(slot.user_data, runtime.user_data);
+			}
+			if (slot.user_data.size() != entry.relevant_inputs.size()) {
+				return false;
+			}
+			for (size_t i = 0; i < entry.relevant_inputs.size(); ++i) {
+				const auto index = entry.relevant_inputs[i];
+				if (index >= runtime.user_data.size() ||
+				    slot.user_data[i] != runtime.user_data[index]) {
+					return false;
+				}
+			}
+			return true;
+		};
 		for (auto& slot: entry.memo) {
 			if (slot.shader_base == runtime.shader_base &&
+			    slot.float_image_atomics == runtime.float_image_atomics &&
 			    slot.workgroup_count == runtime.workgroup_count &&
 			    slot.workgroup_size == runtime.workgroup_size &&
-			    std::ranges::equal(slot.user_data, runtime.user_data) &&
+			    inputs_match(slot) &&
 			    ReadsUnchanged(slot.log, reads)) {
 				entry.resources      = slot.resources;
+				entry.resources.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
 				entry.specialization = slot.specialization;
 				slot.last_use = memo_clock;
 				memo_hits++;
@@ -1038,8 +1193,20 @@ struct PipelineCache::ProgramCache {
 			} else {
 				slot = &*std::ranges::min_element(entry.memo, {}, &MemoSlot::last_use);
 			}
-			slot->user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
+			slot->user_data.clear();
+			if (relevant) {
+				for (const auto index: entry.relevant_inputs) {
+					if (index < runtime.user_data.size()) {
+						slot->user_data.push_back(runtime.user_data[index]);
+				}
+				}
+			} else {
+				slot->user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
+			}
+			slot->user_data_count = static_cast<uint32_t>(runtime.user_data.size());
+			slot->relevant_inputs = relevant;
 			slot->shader_base    = runtime.shader_base;
+			slot->float_image_atomics = runtime.float_image_atomics;
 			slot->workgroup_count = runtime.workgroup_count;
 			slot->workgroup_size  = runtime.workgroup_size;
 			slot->log            = std::move(log);
@@ -1146,6 +1313,109 @@ struct PipelineCache::ProgramCache {
 
 	static constexpr std::size_t MaxStaticKeyWords = 32 + ShaderVertexInputInfo::RES_MAX * 6;
 
+	static bool ResourceWorkerEnabled() {
+		static auto& enabled = Common::LiveSwitches::Get("KYTY_RESOURCE_WORKER", 0);
+		static auto& capture = Common::LiveSwitches::Get("KYTY_RESOURCE_CAPTURE", 0);
+		return enabled.load(std::memory_order_relaxed) != 0 &&
+		       capture.load(std::memory_order_relaxed) == 0 && !ResourceMemoEnabled();
+	}
+
+	template <typename InputInfo>
+	SourceEntry* FindWarmStage(const ShaderParams& params, const InputInfo& info) {
+		auto& key = worker_key;
+		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) key.stage = info.logical_stage;
+		else key.stage = ShaderType::Pixel;
+		key.hash = params.hash;
+		key.user_data_count = params.user_data_count;
+		key.code_size = static_cast<uint32_t>(params.code.size());
+		key.function_code.clear();
+		BuildStageStaticKey(info, key.static_state);
+		if (const auto targets = call_targets.find(params.hash); targets != call_targets.end()) {
+			for (const auto index: targets->second) key.static_state.push_back(
+			    index < params.user_data_count ? params.user_data[index] : 0u);
+		}
+		const auto found = programs.find(key);
+		if (found == programs.end()) return nullptr;
+		return &found->second;
+	}
+
+	template <typename InputInfo>
+	SourceEntry* StartResources(const ShaderParams& params, const InputInfo& info) {
+		if (!ResourceWorkerEnabled()) return nullptr;
+		auto* found = FindWarmStage(params, info);
+		if (found == nullptr) return nullptr;
+		auto& entry = *found;
+		// Waking a worker for a tiny SRT costs more than evaluating it directly.
+		if (entry.resource_plan.srt_reads.size() < 128) return nullptr;
+		entry.worker_requested = true;
+		if (!entry.worker_prepare_tried) {
+			entry.worker_prepared = ShaderRecompiler::IR::PrepareResourceEvaluation(entry.resource_plan);
+			entry.worker_prepare_tried = true;
+		}
+		if (!entry.worker_prepared || entry.worker_pages.empty() || entry.worker_pages.size() > 16) return nullptr;
+		if (!resource_worker) resource_worker = std::make_unique<ResourceEvaluationWorker>();
+		const auto copy_begin = std::chrono::steady_clock::now();
+		auto& job = resource_worker->job;
+		job.memory.pages.resize(entry.worker_pages.size());
+		for (size_t i = 0; i < entry.worker_pages.size(); ++i) {
+			auto& page = job.memory.pages[i];
+			page.address = entry.worker_pages[i];
+			if (!Libs::LibKernel::Memory::TryReadGpuCleanBacking(page.address, page.bytes.data(), page.bytes.size())) {
+				++worker_unclean;
+				return nullptr;
+			}
+		}
+		job.plan = &entry.resource_plan;
+		job.session = &entry.worker_session;
+		job.user_data = params.user_data;
+		job.user_data_count = params.user_data_count;
+		job.shader_base = params.Base();
+		job.float_image_atomics = Config::FloatImageAtomicsEnabled();
+		worker_copy_us += std::chrono::duration<double, std::micro>(
+		    std::chrono::steady_clock::now() - copy_begin).count();
+		resource_worker->Submit();
+		++worker_submitted;
+		return &entry;
+	}
+
+	SourceEntry* PrepareVertexResources(const ShaderParams& params, const ShaderVertexInputInfo& info) {
+		auto* entry = FindWarmStage(params, info);
+		if (entry == nullptr) return nullptr;
+		BufferCache::SetReadbackStatsShader(params.hash);
+		ShaderReadChunks reads(ShaderReadChunks::Mode());
+		ShaderRecompiler::IR::SrtRuntime runtime {
+		    .user_data = std::span(params.user_data).first(params.user_data_count),
+		    .shader_base = params.Base(), .read_memory = ReadShaderGuestMemoryRaw,
+		    .userdata = &reads, .read_specialization_memory = ReadShaderGuestMemory,
+		    .float_image_atomics = Config::FloatImageAtomicsEnabled()};
+		return Materialize(*entry, runtime, reads) ? entry : nullptr;
+	}
+
+	bool FinishResources(SourceEntry* entry) {
+		if (entry == nullptr) return false;
+		const auto wait_begin = std::chrono::steady_clock::now();
+		resource_worker->Wait();
+		worker_wait_us += std::chrono::duration<double, std::micro>(
+		    std::chrono::steady_clock::now() - wait_begin).count();
+		worker_evaluation_us += resource_worker->job.evaluation_us;
+		const bool ok = resource_worker->job.ok;
+		if (ok) {
+			std::swap(entry->resources, resource_worker->job.resources);
+			std::swap(entry->specialization, resource_worker->job.specialization);
+		}
+		if (ok) ++worker_completed; else ++worker_fallback;
+		const auto now = std::chrono::steady_clock::now();
+		if (now - worker_report > std::chrono::seconds(5)) {
+			std::printf("Resource worker: submitted=%" PRIu64 " completed=%" PRIu64
+			    " fallback=%" PRIu64 " unclean=%" PRIu64 " copy_us=%.2f wait_us=%.2f eval_us=%.2f\n", worker_submitted,
+			    worker_completed, worker_fallback, worker_unclean,
+			    worker_copy_us / worker_submitted, worker_wait_us / worker_submitted,
+			    worker_evaluation_us / worker_submitted);
+			worker_report = now;
+		}
+		return ok;
+	}
+
 	// KYTY_PROGRAM_DISK_CACHE (programDiskCache.h): the key of a permutation, from the same
 	// inputs this cache reuses a permutation for within a session, plus the compiled code.
 	ProgramDiskCache::Key DiskKey(const ShaderRecompiler::CompileOptions&             options,
@@ -1153,7 +1423,15 @@ struct PipelineCache::ProgramCache {
 	                              const ShaderRecompiler::IR::ResourceSpecialization& specialization,
 	                              uint32_t push_data_start_dword) const {
 		ProgramDiskCache::KeyBuilder key;
-		key.U32(1); // key layout version
+		// The revision override intentionally preserves warm plans across host-only
+		// changes. Backend changes still need a new permutation key: old task mesh
+		// modules tested a push flag and have no pipeline specialization constant.
+		static const bool mesh_task_backend = [] {
+			const auto* value = std::getenv("KYTY_MESH_TASK_INDIRECT");
+			return value != nullptr && std::atoi(value) != 0;
+		}();
+		key.U32(options.stage == ShaderType::Mesh && mesh_task_backend
+		    ? ShaderRecompiler::IR::PushData::MeshTaskBackendVersion : 1u);
 		key.U32(static_cast<uint32_t>(lookup_key.stage));
 		key.U64(lookup_key.hash);
 		key.U32(lookup_key.user_data_count);
@@ -1348,7 +1626,7 @@ struct PipelineCache::ProgramCache {
 
 	template <typename InputInfo>
 	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info,
-	                  uint32_t& push_data_cursor) {
+	                  uint32_t& push_data_cursor, SourceEntry* prepared = nullptr) {
 		ShaderType stage;
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			stage = input_info.logical_stage;
@@ -1370,7 +1648,10 @@ struct PipelineCache::ProgramCache {
 			lookup_key.hash            = params.hash;
 			lookup_key.user_data_count = params.user_data_count;
 			lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
-			BuildStageStaticKey(input_info, lookup_key.static_state);
+			{
+				KYTY_PROFILER_BLOCK("ProgramCache::BuildStageStaticKey");
+				BuildStageStaticKey(input_info, lookup_key.static_state);
+			}
 			// Research: a program with inlined calls is valid only for the same call targets.
 			if (const auto found = call_targets.find(params.hash); found != call_targets.end()) {
 				for (const auto index: found->second) {
@@ -1382,6 +1663,7 @@ struct PipelineCache::ProgramCache {
 			// recompiler's own inliner.
 			lookup_key.function_code.clear();
 			if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+				KYTY_PROFILER_BLOCK("ProgramCache::ExpandShaderFunctions");
 				ExpandShaderFunctions(params, user_data, input_info.wave_size,
 				                      lookup_key.function_code);
 			}
@@ -1396,6 +1678,7 @@ struct PipelineCache::ProgramCache {
 		}
 		NotePredictability(stage, entry != programs.end() ? &entry->second : nullptr, user_data);
 		ShaderReadChunks                 read_chunks(ShaderReadChunks::Mode());
+		static auto& capture_spans = Common::LiveSwitches::Get("KYTY_SRT_CAPTURE_SPANS", 0);
 		ShaderRecompiler::IR::SrtRuntime runtime {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
@@ -1403,6 +1686,10 @@ struct PipelineCache::ProgramCache {
 		    .userdata                   = &read_chunks,
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		    .float_image_atomics        = Config::FloatImageAtomicsEnabled(),
+		    .fast_read = read_chunks.FastRead(),
+		    .fast_specialization_read = read_chunks.FastRead(),
+		    .capture_read_spans = capture_spans.load(std::memory_order_relaxed) != 0,
+		    .capture_bulk_reads = capture_spans.load(std::memory_order_relaxed) >= 2,
 		};
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			for (uint32_t axis = 0; axis < 3u; axis++) {
@@ -1414,7 +1701,11 @@ struct PipelineCache::ProgramCache {
 			bool materialized = false;
 			{
 				KYTY_PROFILER_BLOCK("ProgramCache::MaterializeResources");
-				materialized = Materialize(entry->second, runtime, read_chunks);
+				if (prepared == &entry->second) {
+					materialized = true;
+				} else {
+					materialized = Materialize(entry->second, runtime, read_chunks);
+				}
 				if (ShaderRecompiler::IR::SrtNativeStats stats;
 				    ShaderRecompiler::IR::TakeSrtNativeReport(stats)) {
 					::printf("SRT native: %u plans compiled, %u failed, %" PRIu64 " KB of code, %" PRIu64
@@ -1754,6 +2045,7 @@ struct PipelineCache::ProgramCache {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
 	~ProgramCache() {
+		resource_worker.reset();
 		async_compiler.reset(); // joins the worker; a job it was compiling finishes first
 		for (const auto& [key, entry]: programs) {
 			(void)key;
@@ -1791,6 +2083,11 @@ struct PipelineCache::ProgramCache {
 	std::unordered_set<ProgramKey, ProgramKeyHash>              unsupported;
 	ShaderRecompiler::Decoder::ShaderFunctionExpander          function_expander;
 	ProgramKey                                                  lookup_key;
+	ProgramKey                                                  worker_key;
+	std::unique_ptr<ResourceEvaluationWorker> resource_worker;
+	uint64_t worker_submitted = 0, worker_completed = 0, worker_fallback = 0, worker_unclean = 0;
+	double worker_copy_us = 0, worker_wait_us = 0, worker_evaluation_us = 0;
+	std::chrono::steady_clock::time_point worker_report = std::chrono::steady_clock::now();
 	// Research: per shader hash, the user-data dwords holding its inlined call targets.
 	std::unordered_map<uint64_t, std::vector<uint32_t>>         call_targets;
 	// KYTY_RESOURCE_MEMO bookkeeping (GPU thread).
@@ -2238,8 +2535,15 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	uint32_t          push_data_cursor =
 	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
 	GraphicsPrograms  result;
+	// Only an ordinary VS/PS pair: merged/tessellation stages retain the serial path.
+	auto* resource_job = pixel_active && !tess_active && !mesh_active
+	    ? m_program_cache->StartResources(pixel_params, pixel_info) : nullptr;
+	auto* vertex_resources = resource_job != nullptr
+	    ? m_program_cache->PrepareVertexResources(vertex_params[0], vertex_info[0]) : nullptr;
+	const bool resource_ready = m_program_cache->FinishResources(resource_job);
 	if (pixel_active) {
-		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
+		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor,
+		    resource_ready ? resource_job : nullptr);
 		// The draw is skipped without a pixel program (a skipped or failed shader, or one an
 		// async worker is compiling); building the vertex stages now would only give them a
 		// push-data start without the pixel stage's data: a permutation never used.
@@ -2248,7 +2552,8 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		}
 	}
 	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
-		result.vertex[i] = m_program_cache->Get(vertex_params[i], vertex_info[i], push_data_cursor);
+		result.vertex[i] = m_program_cache->Get(vertex_params[i], vertex_info[i], push_data_cursor,
+		    i == 0 ? vertex_resources : nullptr);
 		if (!result.vertex[i]) {
 			return {};
 		}
@@ -2313,7 +2618,7 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
     std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
     std::span<const ShaderVertexInputInfo> vertex_info, CommandBuffer& command,
     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
-    bool primitive_restart_enable, const GraphicsPrograms& programs, bool may_defer) {
+    bool primitive_restart_enable, const GraphicsPrograms& programs, bool may_defer, bool mesh_task_indirect) {
 	const auto& vs_input_info  = vertex_info.front();
 	const auto& vertex_program = programs.vertex[0];
 	const auto& pixel_program  = programs.pixel;
@@ -2338,6 +2643,7 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 	}
 	key.ps_shader_id            = ps_id;
 	auto& static_params         = key.static_params;
+	static_params.mesh_task_indirect = mesh_task_indirect;
 	auto& rendering             = key.rendering;
 	rendering.color_count       = 0;
 	uint32_t attachment_samples = 0;
@@ -2508,6 +2814,7 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 	}
 
 	auto cached = std::make_unique<Pipeline>();
+	cached->samples = attachment_samples;
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
 	auto build = PrepareGraphicsPipeline(m_graphics, *cached, rendering, key.vertex_input,
 	                                     vertex_info, ps_input_info, programs, static_params);

@@ -331,6 +331,7 @@ int main() {
 	TestPayloadRoundTrip();
 	TestKeys();
 	Check(Disk::AffectsTranslation("KYTY_FOLD_LANE_MASKS") &&
+	          !Disk::AffectsTranslation("KYTY_SRT_BUFFER_GROUP") &&
 	          Disk::AffectsTranslation("KYTY_BINDLESS_SAMPLERS") &&
 	          !Disk::AffectsTranslation("KYTY_VRAM_REPORT") &&
 	          !Disk::AffectsTranslation("KYTY_GC_HOST_SIZES") &&

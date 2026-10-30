@@ -26,6 +26,7 @@ vk::ShaderStageFlagBits NativeShaderStage(ShaderType stage) {
 
 vk::PipelineStageFlags ShaderPipelineStages(vk::ShaderStageFlags stages) {
 	vk::PipelineStageFlags result = {};
+	if (stages & vk::ShaderStageFlagBits::eTaskEXT) result |= vk::PipelineStageFlagBits::eTaskShaderEXT;
 	if (stages & vk::ShaderStageFlagBits::eVertex) {
 		result |= vk::PipelineStageFlagBits::eVertexShader;
 	}

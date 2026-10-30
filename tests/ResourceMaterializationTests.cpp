@@ -1,6 +1,8 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/host_gpu/renderer/pipeline/programDiskCache.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+#include "graphics/host_gpu/renderer/pipeline/resourceWorker.h"
+#include "common/liveSwitches.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -31,7 +33,8 @@ AddValueBlock(Libs::Graphics::ShaderRecompiler::IR::Program &program) {
   return *result;
 }
 
-Libs::Graphics::ShaderRecompiler::IR::ResourcePlan SrtPlan(uint64_t address) {
+Libs::Graphics::ShaderRecompiler::IR::ResourcePlan SrtPlan(uint64_t address, uint32_t count = 1,
+                                                         bool buffer = false, bool descriptors_only = false) {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   Program program;
   program.stage = Libs::Graphics::ShaderType::Compute;
@@ -40,20 +43,37 @@ Libs::Graphics::ShaderRecompiler::IR::ResourcePlan SrtPlan(uint64_t address) {
   auto &value_block = AddValueBlock(program);
 
   MemoryInfo memory;
-  memory.kind = ResourceKind::ScalarAddress;
+  memory.kind = buffer ? ResourceKind::ScalarBuffer : ResourceKind::ScalarAddress;
   memory.planning_only = true;
   program.memory_info.push_back(memory);
   const auto low = Value(static_cast<uint32_t>(address));
   const auto high = Value(static_cast<uint32_t>(address >> 32u));
-  auto &handle =
-      value_block.AppendNewInst(ValueOpcode::GetAddressResource, {low, high});
-  auto &raw = value_block.AppendNewInst(
-      ValueOpcode::LoadAddressU32,
-      {Value(&handle), Value(0u), Value(0u), Value(true)});
-  raw.SetFlags(MemoryFlags{.index = 0, .pc = 0x40});
-  program.srt_reads.push_back({Value(&raw), 0});
+  auto &handle = buffer
+      ? value_block.AppendNewInst(ValueOpcode::GetBufferResource, {low, high, Value(count * 4), Value(0u)})
+      : value_block.AppendNewInst(ValueOpcode::GetAddressResource, {low, high});
+  for (uint32_t i = 0; i < count; ++i) {
+    auto &raw = buffer
+        ? value_block.AppendNewInst(ValueOpcode::ReadConstBuffer, {Value(&handle), Value(i * 4)})
+        : value_block.AppendNewInst(ValueOpcode::LoadAddressU32,
+            {Value(&handle), Value(i * 4), Value(0u), Value(true)});
+    raw.SetFlags(MemoryFlags{.index = 0, .pc = 0x40});
+    program.srt_reads.push_back({Value(&raw), i});
+  }
 
   auto &srt = value_block.AppendNewInst(ValueOpcode::GetSrtResource);
+  if (descriptors_only) {
+    for (uint32_t i = 0; i < count; i += 4) {
+      DescriptorSource source;
+      source.dword_count = 4;
+      for (uint32_t j = 0; j < 4; ++j)
+        source.dwords[j] = Value(&value_block.AppendNewInst(ValueOpcode::ReadConst, {Value(&srt), Value(i + j)}));
+      program.info.buffers.push_back({.source = static_cast<uint32_t>(program.descriptor_sources.size())});
+      program.descriptor_sources.push_back(source);
+    }
+    auto plan = ExtractResourcePlan(program);
+    plan.gpu_flat_slots.assign(count, 0);
+    return plan;
+  }
   auto &flat = value_block.AppendNewInst(ValueOpcode::ReadConst,
                                          {Value(&srt), Value(0u)});
   DescriptorSource source;
@@ -452,10 +472,12 @@ void TestPlanSurvivesDiskRoundTrip() {
   namespace Disk = Libs::Graphics::ProgramDiskCache;
   const uint32_t dword = 0x0badf00d;
   const auto check = [](ResourcePlan original, const SrtRuntime &runtime, const char *name) {
+    original.gpu_flat_slots.assign(original.srt_reads.size(), 1u);
     std::vector<uint8_t> bytes;
     Check(Disk::SerializePlan(original, bytes), name);
     ResourcePlan back;
     Check(Disk::DeserializePlan(bytes, back), name);
+    Check(back.gpu_flat_slots == original.gpu_flat_slots, "GPU flat mask disk round trip");
     ResourceSnapshot a, b;
     ResourceSpecialization sa, sb;
     const bool ma = MaterializeResources(original, runtime, a, sa);
@@ -477,7 +499,197 @@ void TestPlanSurvivesDiskRoundTrip() {
   check(UnbasedFlatPlan(), {}, "unbased flat plan disk round trip");
 }
 
+void TestResourceWorker() {
+  using namespace Libs::Graphics;
+  using namespace ShaderRecompiler::IR;
+  ResourceMemorySnapshot snapshot;
+  snapshot.pages.resize(2);
+  snapshot.pages[0].address = 0x12000;
+  snapshot.pages[1].address = 0x13000;
+  const uint32_t first = 123, second = 456;
+  std::memcpy(snapshot.pages[0].bytes.data() + 4092, &first, 4);
+  std::memcpy(snapshot.pages[1].bytes.data(), &second, 4);
+  std::array<uint32_t, 2> words {};
+  Check(ResourceMemorySnapshot::Read(&snapshot, 0x12ffc, words) &&
+        words[0] == first && words[1] == second, "snapshot cross-page read");
+  Check(!ResourceMemorySnapshot::Read(&snapshot, 0x13ffc, words) && snapshot.missed,
+        "snapshot missing page did not invalidate job");
+  snapshot.missed = false;
+  Check(!ResourceMemorySnapshot::Read(&snapshot, UINT64_MAX - 1, words) && snapshot.missed,
+        "snapshot overflow was accepted");
+
+  auto plan = SrtPlan(0x12000);
+  Check(PrepareResourceEvaluation(plan), "worker plan not prepared");
+  ResourceEvaluationSession session;
+  {
+    ResourceEvaluationWorker worker;
+    auto& job = worker.job;
+    job.plan = &plan; job.session = &session;
+    job.memory.pages.resize(1); job.memory.pages[0].address = 0x12000;
+    for (uint32_t i = 0; i < 1000; ++i) {
+      std::memcpy(job.memory.pages[0].bytes.data(), &i, 4);
+      worker.Submit(); worker.Wait();
+      Check(job.ok && job.resources.flattened_srt.size() == 1 &&
+            job.resources.flattened_srt[0] == i, "worker returned stale snapshot");
+    }
+    job.memory.pages.clear();
+    worker.Submit(); worker.Wait();
+    Check(!job.ok && job.memory.missed, "worker accepted missing memory");
+    job.memory.pages.resize(1); job.memory.pages[0].address = 0x12000;
+    worker.Submit(); // destructor must join an active job before the plan/session disappear
+  }
+  std::puts("ResourceMaterializationTests: worker snapshots, reuse, failure and shutdown passed");
+}
+
+void TestCapturedReadsDisableDirectSpans() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  auto plan = SrtPlan(0x12000);
+  plan.capture_specialization_reads = true;
+  Check(PrepareResourceEvaluation(plan), "captured span plan not prepared");
+  Common::LiveSwitches::Get("KYTY_SRT_DIRECT_READ", 0).store(1);
+  uint32_t bypass_value = 99, reads = 0;
+  SrtReadSpan span {0x12000, reinterpret_cast<const uint8_t*>(&bypass_value), 0};
+  auto read = +[](void* data, uint64_t, std::span<uint32_t> words) {
+    ++*static_cast<uint32_t*>(data); words[0] = 42; return true;
+  };
+  SrtRuntime runtime {.read_memory = read, .userdata = &reads,
+      .read_specialization_memory = read, .fast_read = &span, .fast_specialization_read = &span};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+        snapshot.flattened_srt == std::vector<uint32_t>{42} && reads != 0 &&
+        !snapshot.specialization_reads.empty(), "capture bypassed required reader callbacks");
+  Common::LiveSwitches::Get("KYTY_SRT_DIRECT_READ", 0).store(0);
+}
+
+void TestCapturedReaderSpans() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  struct Memory {
+    std::array<uint32_t, 8> ordinary {10,11,12,13,14,15,16,17};
+    std::array<uint32_t, 8> strict {20,21,22,23,24,25,26,27};
+    SrtReadSpan ordinary_span, strict_span;
+    unsigned reads = 0, strict_reads = 0;
+    bool short_span = false, fail = false;
+  } memory;
+  auto read = +[](void* data, uint64_t address, std::span<uint32_t> words) {
+    auto& m = *static_cast<Memory*>(data); ++m.reads;
+    if (m.fail || address < 0x12000 || address - 0x12000 + words.size_bytes() > 32) return false;
+    std::memcpy(words.data(), reinterpret_cast<const uint8_t*>(m.ordinary.data()) + address - 0x12000, words.size_bytes());
+    m.ordinary_span = {0x12000, reinterpret_cast<const uint8_t*>(m.ordinary.data()), m.short_span ? 0u : 28u};
+    return true;
+  };
+  auto strict_read = +[](void* data, uint64_t address, std::span<uint32_t> words) {
+    auto& m = *static_cast<Memory*>(data); ++m.strict_reads;
+    if (m.fail || address < 0x12000 || address - 0x12000 + words.size_bytes() > 32) return false;
+    std::memcpy(words.data(), reinterpret_cast<const uint8_t*>(m.strict.data()) + address - 0x12000, words.size_bytes());
+    m.strict_span = {0x12000, reinterpret_cast<const uint8_t*>(m.strict.data()), m.short_span ? 0u : 28u};
+    return true;
+  };
+  Common::LiveSwitches::Get("KYTY_SRT_BULK_READS", 0).store(1);
+  Common::LiveSwitches::Get("KYTY_SRT_NATIVE_BATCH", 0).store(1);
+  for (bool descriptors: {false, true}) for (bool buffer: {false, true}) {
+    if (descriptors && !buffer) continue;
+    auto plan = SrtPlan(0x12000, 8, buffer, descriptors);
+    plan.capture_specialization_reads = true;
+    plan.requires_specialization_memory = true;
+    plan.clean_flat_slots.assign(8, 0);
+    for (unsigned i = 4; i < 8; ++i) plan.clean_flat_slots[i] = 1;
+    plan.native_code = SrtNativeCode::Compile(plan, true, false, descriptors);
+    Check(PrepareResourceEvaluation(plan), "capture test plan prepare");
+    if (buffer) Check(plan.native_code->BulkReadRoots() != 0, "captured bulk test did not form a group");
+    SrtRuntime runtime {.read_memory = read, .userdata = &memory,
+      .read_specialization_memory = strict_read, .fast_read = &memory.ordinary_span,
+      .fast_specialization_read = &memory.strict_span};
+    ResourceSnapshot expected, actual;
+    ResourceSpecialization a, b;
+    Check(MaterializeResources(plan, runtime, expected, a), "capture reference");
+    for (bool scalar: {false, true}) for (bool bulk: {false, true}) for (bool short_span: {false, true}) {
+      memory.short_span = short_span;
+      memory.reads = memory.strict_reads = 0;
+      memory.ordinary_span = {}; memory.strict_span = {};
+      runtime.capture_read_spans = scalar;
+      runtime.capture_bulk_reads = bulk;
+      Check(MaterializeResources(plan, runtime, actual, b) &&
+        expected.flattened_srt == actual.flattened_srt &&
+        expected.specialization_reads == actual.specialization_reads && expected.buffers == actual.buffers && a == b,
+        "capture spans changed words, order or exact proof ranges");
+      const auto expected_reads = !short_span && (scalar || (bulk && buffer)) ? 1u : 4u;
+      if (memory.reads != expected_reads || memory.strict_reads != expected_reads)
+        std::fprintf(stderr, "capture span callbacks: buffer=%d scalar=%d bulk=%d short=%d reads=%u strict=%u expected=%u\n",
+          buffer, scalar, bulk, short_span, memory.reads, memory.strict_reads, expected_reads);
+      Check(memory.reads == expected_reads && memory.strict_reads == expected_reads,
+        "capture spans failed to reuse authorized reader-specific page");
+    }
+    memory.fail = true; memory.ordinary_span = {}; memory.strict_span = {};
+    Check(!MaterializeResources(plan, runtime, actual, b), "failed span read accepted");
+    memory.fail = false;
+    runtime.read_specialization_memory = nullptr;
+    Check(!MaterializeResources(plan, runtime, actual, b), "missing strict reader bypassed");
+  }
+  Common::LiveSwitches::Get("KYTY_SRT_BULK_READS", 0).store(0);
+  Common::LiveSwitches::Get("KYTY_SRT_NATIVE_BATCH", 0).store(0);
+}
+
+void TestReadonlyBufferGroup() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  struct Memory {
+    std::array<uint32_t,16> words {};
+    std::vector<std::pair<uint64_t,size_t>> reads;
+    uint64_t fail=UINT64_MAX;
+  } memory;
+  for(uint32_t i=0;i<4;++i){memory.words[i*4]=0x1000+i*256;memory.words[i*4+2]=64;}
+  auto read=+[](void* data,uint64_t address,std::span<uint32_t> words) {
+    auto& m=*static_cast<Memory*>(data);m.reads.emplace_back(address,words.size());
+    if(address<0x24000 || address-0x24000+words.size_bytes()>64 ||
+      (address<=m.fail && m.fail-address<words.size_bytes())) return false;
+    std::memcpy(words.data(),reinterpret_cast<const uint8_t*>(m.words.data())+address-0x24000,words.size_bytes());return true;
+  };
+  auto plan=SrtPlan(0x24000,16,true,true);
+  plan.native_code=SrtNativeCode::Compile(plan,true,false,true);
+  Check(plan.native_code && plan.native_code->HasReadonlyBufferGroup(4),"readonly group was not compiled");
+  SrtRuntime runtime{.read_memory=read,.userdata=&memory,.read_specialization_memory=read};
+  Common::LiveSwitches::Get("KYTY_SRT_NATIVE_BATCH",0).store(1);
+  Common::LiveSwitches::Get("KYTY_SRT_BULK_READS",0).store(1);
+  auto& enabled=Common::LiveSwitches::Get("KYTY_SRT_BUFFER_GROUP",0);
+  ResourceSnapshot expected,actual;ResourceSpecialization a,b;
+  for(unsigned iteration=0;iteration<32;++iteration) {
+    ++memory.words[0];memory.fail=iteration<16 ? UINT64_MAX : 0x24000+(iteration-16)*4;
+    enabled.store(0);memory.reads.clear();const bool ok=MaterializeResources(plan,runtime,expected,a);const auto reads=memory.reads;
+    enabled.store(1);memory.reads.clear();const bool grouped=MaterializeResources(plan,runtime,actual,b);
+    Check(ok==grouped && reads==memory.reads,"readonly group changed failure or guest read order");
+    Check(expected.buffers==actual.buffers,"readonly group changed descriptor words, widths, or failed prefix");
+    if(ok)Check(a==b && expected.flattened_srt==actual.flattened_srt && expected.specialization_reads==actual.specialization_reads,
+      "readonly group changed successful specialization");
+  }
+  memory.fail=UINT64_MAX;
+  std::array<DescriptorValue,6> guarded;for(auto& value:guarded){value.dwords.fill(0xbadfaceu);value.dword_count=123;}
+  {
+    SrtWalker walker(plan,runtime);
+    Check(walker.EvaluateReadonlyBufferGroup(std::span(guarded).subspan(1,4))==std::optional<size_t>(4),"readonly group did not complete guarded output");
+  }
+  Check(guarded.front().dword_count==123 && guarded.back().dword_count==123 &&
+    guarded.front().dwords[0]==0xbadfaceu && guarded.back().dwords[7]==0xbadfaceu,"readonly group overran output");
+  plan.evaluation_session.active_sources.assign(plan.descriptor_sources.size(),1);
+  plan.evaluation_session.active_sources[0]=0;
+  memory.reads.clear();
+  {
+    SrtWalker walker(plan,runtime);
+    Check(walker.EvaluateReadonlyBufferGroup(std::span(guarded).subspan(1,4))==std::optional<size_t>(4),"masked readonly group failed");
+  }
+  Check(std::ranges::none_of(memory.reads,[](const auto& read){return read.first<0x24010;}),"inactive descriptor performed guest reads");
+  Check(guarded[1].dword_count==4 && std::ranges::all_of(guarded[1].dwords,[](auto word){return word==0;}),"inactive descriptor was not empty");
+  plan.evaluation_session.active_sources.clear();
+  auto written=SrtPlan(0x24000,16,true,true);written.info.buffers[0].written=true;
+  written.native_code=SrtNativeCode::Compile(written,true,false,true);
+  Check(written.native_code && !written.native_code->HasReadonlyBufferGroup(4),"writable buffer was grouped");
+  enabled.store(0);Common::LiveSwitches::Get("KYTY_SRT_BULK_READS",0).store(0);Common::LiveSwitches::Get("KYTY_SRT_NATIVE_BATCH",0).store(0);
+}
+
 int main() {
+  TestReadonlyBufferGroup();
+  TestResourceWorker();
+  TestCapturedReadsDisableDirectSpans();
+  TestCapturedReaderSpans();
   TestPlanSurvivesDiskRoundTrip();
   TestMappedSrtUsesDirectReaderByDefault();
   TestIntegerRuntimeValueFollowsSrtReads();

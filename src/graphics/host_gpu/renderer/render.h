@@ -276,7 +276,6 @@ private:
 	std::vector<ImageId>                  m_bindless_used;
 	std::vector<std::pair<BindlessTable::Heap*, uint32_t>> m_bindless_reresolve;
 	std::vector<uint32_t>                 m_bindless_srt;
-	std::vector<vk::DescriptorBufferInfo> m_descriptor_buffers;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
 	std::vector<uint32_t>                 m_image_occurrences;

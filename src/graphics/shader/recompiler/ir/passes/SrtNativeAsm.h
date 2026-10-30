@@ -95,6 +95,7 @@ public:
 		RexOpt(false, dst, base), Byte(0x8b), ModMem(dst, base, disp);
 	}
 	void Store(Reg base, int32_t disp, Reg src) { Rex(true, src, base), Byte(0x89), ModMem(src, base, disp); }
+	void Store32(Reg base, int32_t disp, Reg src) { RexOpt(false, src, base), Byte(0x89), ModMem(src, base, disp); }
 	void StoreImm32(Reg base, int32_t disp, int32_t imm) {
 		Rex(true, 0, base), Byte(0xc7), ModMem(0, base, disp), Imm32(static_cast<uint32_t>(imm));
 	}

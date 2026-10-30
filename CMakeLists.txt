@@ -312,6 +312,19 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${dispatch_indirect_groups_shader_header}")
+set(mesh_task_source "${gpu_tiler_shader_dir}/mesh_indirect.task")
+set(mesh_task_spv "${gpu_tiler_generated_dir}/mesh_indirect_task.spv")
+set(mesh_task_header "${gpu_tiler_generated_dir}/mesh_indirect_task_spv.h")
+add_custom_command(
+	OUTPUT "${mesh_task_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os -o "${mesh_task_spv}" "${mesh_task_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${mesh_task_spv} -DOUTPUT=${mesh_task_header}
+	        -DSYMBOL=MESH_INDIRECT_TASK_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${mesh_task_source}"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${mesh_task_header}")
 list(APPEND kyty_emulator_src ${gpu_tiler_shader_headers})
 
 set(gpu_blit_generated_dir "${PROJECT_BINARY_DIR}/gpu_blit_shaders")
@@ -531,6 +544,20 @@ add_executable(srt_native_tests EXCLUDE_FROM_ALL
 )
 target_link_libraries(srt_native_tests fmt::fmt common)
 target_include_directories(srt_native_tests PRIVATE ${inc_headers})
+
+# Replays captured resource materializations without booting a game or accessing guest memory.
+add_executable(resource_replay_bench EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ResourceReplayBench.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtNative.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtNativeMemory.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/programDiskCache.cpp"
+)
+target_link_libraries(resource_replay_bench fmt::fmt common xxhash)
+target_include_directories(resource_replay_bench PRIVATE ${inc_headers})
 
 add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ResourceTrackingTests.cpp"

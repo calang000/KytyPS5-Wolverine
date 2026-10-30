@@ -12,12 +12,14 @@
 #include <atomic>
 #include <cinttypes>
 #include <bit>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <functional>
 #include <mutex>
+#include <map>
 #include <numeric>
 #include <unordered_set>
 
@@ -26,6 +28,60 @@ namespace {
 
 constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;
 constexpr uint64_t MaxIndirectImageProbes = 65536u;
+
+// Diagnostic only: aggregate phases by shader rather than millions of trace events.
+// Keep it off in FPS measurements; it is intended to select the next optimization.
+class MaterializationProfile {
+public:
+	enum Phase { Setup, Flat, Buffers, Extents, Images, Samplers, Final, Count };
+	explicit MaterializationProfile(const ResourcePlan& plan) {
+		static const bool enabled = [] {
+			const auto* value = std::getenv("KYTY_MATERIALIZE_PROFILE");
+			return value != nullptr && std::strcmp(value, "1") == 0;
+		}();
+		if (!enabled) return;
+		m_last = Clock::now();
+		auto& entry = State().entries[{plan.shader_hash, static_cast<uint32_t>(plan.stage)}];
+		entry.roots = plan.srt_reads.size(); entry.captured = plan.capture_specialization_reads;
+		m_entry = &entry;
+	}
+	void Mark(Phase phase) {
+		if (m_entry == nullptr) return;
+		const auto now = Clock::now();
+		m_entry->ns[phase] += std::chrono::duration_cast<std::chrono::nanoseconds>(now - m_last).count();
+		m_last = now;
+	}
+	~MaterializationProfile() {
+		if (m_entry == nullptr) return;
+		Mark(Final); ++m_entry->calls;
+		auto& state = State();
+		if (m_last - state.report < std::chrono::seconds(5)) return;
+		state.report = m_last;
+		std::vector<std::pair<std::pair<uint64_t, uint32_t>, const Entry*>> ranked;
+		for (const auto& [key, entry]: state.entries) ranked.emplace_back(key, &entry);
+		const auto total = [](const Entry& e) {
+			uint64_t ns = 0; for (const auto value: e.ns) ns += value; return ns;
+		};
+		std::ranges::sort(ranked, [&](const auto& a, const auto& b) { return total(*a.second) > total(*b.second); });
+		for (size_t i = 0; i < std::min(size_t(12), ranked.size()); ++i) {
+			const auto& [key, entry] = ranked[i];
+			std::printf("Materialize phase: hash=%016" PRIx64 " stage=%u capture=%d roots=%zu calls=%" PRIu64
+			    " total_ms=%.3f setup=%.3f flat=%.3f buffers=%.3f extents=%.3f images=%.3f samplers=%.3f final=%.3f\n",
+			    key.first, key.second, entry->captured, entry->roots, entry->calls, total(*entry) / 1e6,
+			    entry->ns[Setup]/1e6, entry->ns[Flat]/1e6, entry->ns[Buffers]/1e6, entry->ns[Extents]/1e6,
+			    entry->ns[Images]/1e6, entry->ns[Samplers]/1e6, entry->ns[Final]/1e6);
+		}
+		std::fflush(stdout);
+		for (auto& [key, entry]: state.entries) { entry.calls = 0; entry.ns = {}; }
+	}
+private:
+	using Clock = std::chrono::steady_clock;
+	struct Entry { uint64_t calls = 0; size_t roots = 0; bool captured = false; std::array<uint64_t, Count> ns {}; };
+	struct Data { Clock::time_point report = Clock::now(); std::map<std::pair<uint64_t, uint32_t>, Entry> entries; };
+	static Data& State() { static thread_local Data state; return state; }
+	Entry* m_entry = nullptr;
+	Clock::time_point m_last;
+};
 
 bool SpecializationFail(std::string_view message) {
 	std::fprintf(stderr, "shader resource specialization failed: %.*s\n",
@@ -151,9 +207,22 @@ struct ReadCapture {
 	std::vector<std::pair<uint64_t, uint64_t>>& ranges;
 };
 
+bool CapturedSpanRead(const ReadCapture& capture, const SrtReadSpan* span,
+                      uint64_t address, std::span<uint32_t> values) {
+	if (!capture.source.capture_read_spans || span == nullptr || span->data == nullptr ||
+	    values.empty() || address < span->base) return false;
+	const auto offset = address - span->base;
+	// last_dword_offset describes the last complete word; subtraction avoids overflow.
+	if (offset > span->last_dword_offset ||
+	    values.size_bytes() - sizeof(uint32_t) > span->last_dword_offset - offset) return false;
+	std::memcpy(values.data(), span->data + offset, values.size_bytes());
+	return true;
+}
+
 bool CaptureStrictRead(void* userdata, uint64_t address, std::span<uint32_t> values) {
 	auto& capture = *static_cast<ReadCapture*>(userdata);
-	if (!capture.source.read_specialization_memory(capture.source.userdata, address, values)) {
+	if (!CapturedSpanRead(capture, capture.source.fast_specialization_read, address, values) &&
+	    !capture.source.read_specialization_memory(capture.source.userdata, address, values)) {
 		return false;
 	}
 	capture.ranges.emplace_back(address, values.size_bytes());
@@ -162,7 +231,9 @@ bool CaptureStrictRead(void* userdata, uint64_t address, std::span<uint32_t> val
 
 bool CaptureOrdinaryRead(void* userdata, uint64_t address, std::span<uint32_t> values) {
 	auto& capture = *static_cast<ReadCapture*>(userdata);
-	if (capture.source.read_memory != nullptr) {
+	if (CapturedSpanRead(capture, capture.source.fast_read, address, values)) {
+		// The backing was authorized by this reader; retain the exact logical read below.
+	} else if (capture.source.read_memory != nullptr) {
 		if (!capture.source.read_memory(capture.source.userdata, address, values)) return false;
 	} else {
 		std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
@@ -309,7 +380,7 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 		                                specialization);
 	}
 	const auto& sources = indirect.sources;
-	auto& keys = program.material_keys;
+	auto& keys = (runtime.evaluation_session != nullptr ? *runtime.evaluation_session : program.evaluation_session).material_keys;
 	uint64_t table_base = 0;
 	uint64_t table_size = UINT64_MAX; // Scalar addresses have no buffer descriptor bounds.
 	if (sources.empty()) {
@@ -1150,6 +1221,60 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	plan.resource_tracking_complete = program.resource_tracking_complete;
 	plan.descriptor_phi_under_writes = program.descriptor_phi_under_writes;
 	plan.bindless_images            = program.bindless_images;
+	static const bool lazy_flat = [] {
+		const char* flag = std::getenv("KYTY_LAZY_SRT_FLAT");
+		return flag != nullptr && std::strcmp(flag, "1") == 0;
+	}();
+	if (lazy_flat) {
+		plan.gpu_flat_slots.assign(program.srt_reads.size(), 0u);
+		std::unordered_map<const Inst*, uint8_t> needed;
+		std::function<bool(const Inst*, unsigned)> used_by_gpu = [&](const Inst* inst, unsigned depth) -> bool {
+			if (depth >= 128u) return true;
+			if (const auto known = needed.find(inst); known != needed.end())
+				return known->second != 2u; // Cycles are conservative GPU uses.
+			needed[inst] = 0;
+			bool result = true;
+			const auto dense = inst->Flags<uint32_t>();
+			if (inst->GetOpcode() == ValueOpcode::GetImageResource && dense < program.info.images.size() &&
+			    !program.info.images[dense].bindless &&
+			    program.info.images[dense].indirect_root == ImageResource::NoIndirectImage) {
+				result = std::ranges::any_of(inst->Uses(), [](const Use& use) {
+					return ImageOpcodeInfoOf(use.user->GetOpcode()).access == ImageAccess::None;
+				});
+			} else if (inst->GetOpcode() == ValueOpcode::GetSamplerResource &&
+			           dense < program.info.samplers.size() && !program.info.samplers[dense].bindless) {
+				result = std::ranges::any_of(inst->Uses(), [](const Use& use) {
+					return ImageOpcodeInfoOf(use.user->GetOpcode()).access == ImageAccess::None;
+				});
+			} else if (inst->GetOpcode() == ValueOpcode::GetBufferResource &&
+			           dense < program.info.buffers.size() && !program.info.buffers[dense].gpu_records) {
+				result = std::ranges::any_of(inst->Uses(), [&](const Use& use) {
+					if (BufferAccessOf(use.user->GetOpcode()) == BufferAccess::None) return true;
+					const auto index = use.user->Flags<MemoryFlags>().index;
+					return index >= program.memory_info.size() ||
+					       program.memory_info[index].kind == ResourceKind::IndirectBuffer ||
+					       program.memory_info[index].gpu_records;
+				});
+			} else if (!inst->Uses().empty() && !inst->MayHaveSideEffects()) {
+				result = std::ranges::any_of(inst->Uses(), [&](const Use& use) { return used_by_gpu(use.user, depth + 1u); });
+			}
+			needed[inst] = result ? 1u : 2u;
+			return result;
+		};
+		// References from the CFG are explicit roots even if they have no reverse-use entry.
+		const auto mark_cfg = [&](Value value) {
+			if (const auto* inst = value.Resolve().TryInstruction()) needed[inst] = 1u;
+		};
+		for (const auto& block: program.block_info) {
+			mark_cfg(block.condition); mark_cfg(block.indirect_target);
+		}
+		for (const auto* block: program.blocks) for (const auto& inst: *block) {
+			if (inst.GetOpcode() != ValueOpcode::ReadConst || !used_by_gpu(&inst, 0u)) continue;
+			const auto slot = inst.Arg(1).Resolve();
+			if (slot.IsImmediate() && slot.GetType() == Type::U32 && slot.U32() < plan.gpu_flat_slots.size())
+				plan.gpu_flat_slots[slot.U32()] = 1u;
+		}
+	}
 
 	std::unordered_map<const Inst*, Inst*> cloned;
 	std::function<Value(Value)>            Clone = [&](Value value) -> Value {
@@ -1547,6 +1672,7 @@ int LastIndirectImageFailureLine() {
 
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+	MaterializationProfile profile(program);
 	g_indirect_failure_line = 0;
 	snapshot.bindless_heaps.clear();
 	snapshot.bindless_sampler_heaps.clear();
@@ -1560,6 +1686,14 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	ReadCapture capture {runtime, reads};
 	SrtRuntime observed = runtime;
 	if (capture_reads) {
+		if (runtime.capture_bulk_reads) {
+			observed.captured_bulk_read = runtime.fast_read;
+			observed.captured_bulk_specialization_read = runtime.read_specialization_memory != nullptr
+			    ? runtime.fast_specialization_read : nullptr;
+			observed.captured_reads = &reads;
+		}
+		observed.fast_read = nullptr;
+		observed.fast_specialization_read = nullptr;
 		observed.userdata = &capture;
 		observed.read_specialization_memory = runtime.read_specialization_memory != nullptr
 		                                         ? CaptureStrictRead : nullptr;
@@ -1567,10 +1701,12 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	}
 	SrtWalker clean(program, CleanRuntime(observed));
 	SrtWalker walker(program, observed, program.clean_flat_slots, &clean);
+	profile.Mark(MaterializationProfile::Setup);
 	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt)) {
 		return FailIndirect(__LINE__);
 	}
-	const auto active = std::span<const uint8_t>(program.active_sources);
+	const auto active = std::span<const uint8_t>((runtime.evaluation_session != nullptr ? *runtime.evaluation_session : program.evaluation_session).active_sources);
+	profile.Mark(MaterializationProfile::Flat);
 	snapshot.uniform_fill = {};
 	const auto& fill = program.uniform_fill;
 	const auto words = fill.fill.words;
@@ -1595,11 +1731,13 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		return true;
 	};
 	snapshot.buffers.resize(program.info.buffers.size());
+	const auto buffer_group=walker.EvaluateReadonlyBufferGroup(snapshot.buffers);
 	specialization.buffers.clear();
 	specialization.buffers.reserve(program.info.buffers.size());
 	for (uint32_t i = 0; i < program.info.buffers.size(); ++i) {
-		bool evaluated = evaluate(program.info.buffers[i].source, snapshot.buffers[i],
-		                          program.info.buffers[i].written);
+		bool evaluated = buffer_group && i<=*buffer_group ? i<*buffer_group :
+		    evaluate(program.info.buffers[i].source,snapshot.buffers[i],program.info.buffers[i].written);
+		if (buffer_group && i==*buffer_group) snapshot.buffers[i].dword_count=4;
 		if (!evaluated && OnlyPlanningAccesses(program, i) && EmptyDeadBuffers()) {
 			// Every access through this buffer is planning-only: the S# reads a bindless
 			// sampler plan stranded (the shader indexes the host's sampler mirror instead), so
@@ -1677,11 +1815,13 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		// Write extents only size the GPU-written range; their reads do not specialize the
 		// shader, so they stay out of the specialization-read proof.
 		const auto captured = reads.size();
+		profile.Mark(MaterializationProfile::Buffers);
 		ComputeBufferWriteExtents(program, observed, walker, snapshot);
 		if (capture_reads) {
 			reads.resize(captured);
 		}
 	}
+	profile.Mark(MaterializationProfile::Extents);
 	snapshot.images.resize(program.info.images.size());
 	specialization.images.resize(program.info.images.size());
 	for (uint32_t i = 0; i < program.info.images.size(); ++i) {
@@ -1720,6 +1860,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			}
 		}
 	}
+	profile.Mark(MaterializationProfile::Images);
 	snapshot.samplers.resize(program.info.samplers.size());
 	specialization.samplers.assign(program.info.samplers.size(), {});
 	for (uint32_t i = 0; i < program.info.samplers.size(); ++i) {
@@ -1769,6 +1910,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			}
 		}
 	}
+	profile.Mark(MaterializationProfile::Samplers);
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
 	if (!BuildResourceSpecialization(program, snapshot, specialization,
 	                                 runtime.float_image_atomics)) {

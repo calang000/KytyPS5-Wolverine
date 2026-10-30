@@ -21,6 +21,9 @@
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
 SrtRuntime CleanRuntime(SrtRuntime runtime) {
+	runtime.captured_bulk_read = runtime.read_specialization_memory != nullptr
+	    ? runtime.captured_bulk_specialization_read : nullptr;
+	runtime.fast_read = runtime.read_specialization_memory != nullptr ? runtime.fast_specialization_read : nullptr;
 	runtime.read_memory = runtime.read_specialization_memory != nullptr
 	                          ? runtime.read_specialization_memory
 	                          : +[](void*, uint64_t, std::span<uint32_t>) { return false; };
@@ -475,7 +478,8 @@ SrtWalker::SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
                      Value active_mask)
     : m_program(program), m_runtime(runtime), m_clean_flat_slots(clean_flat_slots),
       m_clean_evaluator(clean_evaluator), m_active_mask(active_mask.Resolve()),
-      m_context(AcquireContext(program)) {
+      m_session(SelectSession(program, runtime.evaluation_session)),
+      m_context(AcquireContext(m_session)) {
 	const auto mode = m_active_mask.IsEmpty() ? CompiledMode() : 0;
 	if (mode != 0) {
 		m_compiled = GetCompiled(program);
@@ -499,6 +503,11 @@ namespace {
 // already compiled keep their code for when it is turned on again.
 bool NativeEnabled() {
 	static auto& enabled = Common::LiveSwitches::Get("KYTY_SRT_NATIVE", 1);
+	return enabled.load(std::memory_order_relaxed) != 0;
+}
+
+bool NativeBatchEnabled() {
+	static auto& enabled = Common::LiveSwitches::Get("KYTY_SRT_NATIVE_BATCH", 0);
 	return enabled.load(std::memory_order_relaxed) != 0;
 }
 
@@ -559,11 +568,56 @@ void SrtWalker::BindNative() {
 			return;
 		}
 	}
+	static auto& aliases = Common::LiveSwitches::Get("KYTY_SRT_VALUE_ALIASES", 0);
+	static const bool prepare_aliases = [] {
+		const auto* value = std::getenv("KYTY_SRT_PREPARE_ALIASES");
+		return value != nullptr && value[0] != '0';
+	}();
+	// Explicit worker sessions keep the already-prepared classic code; never mutate a plan's
+	// optional code pointer from a worker or race an owning-thread initialization.
+	const bool want_aliases = m_runtime.evaluation_session == nullptr &&
+	    aliases.load(std::memory_order_relaxed) != 0;
+	if (m_runtime.evaluation_session == nullptr && (want_aliases || prepare_aliases) &&
+	    !program.native_alias_attempted) {
+		program.native_alias_attempted = true;
+		program.native_alias_code = SrtNativeCode::Compile(program, true, false);
+	}
+	static auto& canonical = Common::LiveSwitches::Get("KYTY_SRT_CANONICAL_VIEWS", 0);
+	static const bool prepare_canonical = [] {
+		const auto* value = std::getenv("KYTY_SRT_PREPARE_CANONICAL");
+		return value != nullptr && value[0] != '0';
+	}();
+	const bool want_canonical = want_aliases && canonical.load(std::memory_order_relaxed) != 0;
+	if (m_runtime.evaluation_session == nullptr && (want_canonical || prepare_canonical) &&
+	    !program.native_canonical_attempted) {
+		program.native_canonical_attempted = true;
+		program.native_canonical_code = SrtNativeCode::Compile(program, true, false, true);
+	}
+	static auto& lazy_refresh = Common::LiveSwitches::Get("KYTY_LAZY_SRT_REFRESH", 1);
+	static const bool prepare_eager = [] {
+		const auto* value = std::getenv("KYTY_SRT_PREPARE_EAGER");
+		return value != nullptr && value[0] != '0';
+	}();
+	const bool want_eager = want_canonical && !program.gpu_flat_slots.empty() &&
+	    lazy_refresh.load(std::memory_order_relaxed) == 0;
+	if (want_canonical && !program.gpu_flat_slots.empty() && (want_eager || prepare_eager) &&
+	    !program.native_eager_canonical_attempted) {
+		program.native_eager_canonical_attempted = true;
+		program.native_eager_canonical_code = SrtNativeCode::Compile(program, true, false, true, true);
+		if (prepare_eager && program.native_eager_canonical_code != nullptr) {
+			std::printf("Native eager flat prepared: shader=0x%016" PRIx64 " bytes=%zu\n",
+			            program.shader_hash, program.native_eager_canonical_code->CodeSize());
+		}
+	}
+	const auto* selected_code = want_eager && program.native_eager_canonical_code != nullptr
+	    ? program.native_eager_canonical_code.get() : want_canonical && program.native_canonical_code != nullptr
+	    ? program.native_canonical_code.get() : want_aliases && program.native_alias_code != nullptr
+	    ? program.native_alias_code.get() : program.native_code.get();
 	auto mode = SrtNativeMode::Self;
 	if (m_clean_evaluator != nullptr) {
 		// Split code evaluates the plan's clean slots and every select predicate in the clean
 		// walker, which must itself run Self code for this plan.
-		if (m_clean_evaluator->m_native != program.native_code.get() ||
+		if (m_clean_evaluator->m_native != selected_code ||
 		    m_clean_evaluator->m_native_mode != SrtNativeMode::Self ||
 		    &m_clean_evaluator->m_program != &program ||
 		    m_clean_flat_slots.size() != program.clean_flat_slots.size() ||
@@ -585,12 +639,35 @@ void SrtWalker::BindNative() {
 	m_native_frame.clean =
 	    mode == SrtNativeMode::Split ? &m_clean_evaluator->m_native_frame : nullptr;
 	m_native_frame.failed = &m_failed_value;
-	m_native              = program.native_code.get();
+	static auto& direct = Common::LiveSwitches::Get("KYTY_SRT_DIRECT_READ", 0);
+	static auto& bulk = Common::LiveSwitches::Get("KYTY_SRT_BULK_READS", 0);
+	const bool bulk_enabled = bulk.load(std::memory_order_relaxed) != 0;
+	m_native_frame.bulk_reads = bulk_enabled;
+	m_native_frame.captured_bulk_read = bulk_enabled ? m_runtime.captured_bulk_read : nullptr;
+	m_native_frame.captured_reads = m_runtime.captured_reads;
+	m_native_frame.fast_read = direct.load(std::memory_order_relaxed) != 0 || bulk_enabled ? m_runtime.fast_read : nullptr;
+	static auto& views = Common::LiveSwitches::Get("KYTY_SRT_BUFFER_VIEWS", 0);
+	m_native_frame.buffer_views = nullptr;
+	if (views.load(std::memory_order_relaxed) != 0 || bulk_enabled) {
+		if (m_context.buffer_views.size() < selected_code->BufferViewCount())
+			m_context.buffer_views.resize(selected_code->BufferViewCount());
+		m_native_frame.buffer_views = m_context.buffer_views.data();
+	}
+	m_native              = selected_code;
 	m_native_mode         = mode;
 }
 
 bool SrtWalker::UseNativeTables() const {
 	return m_native != nullptr;
+}
+
+bool PrepareResourceEvaluation(const ResourcePlan& program) {
+	if (!NativeEnabled() || !SrtNativeCode::Supported()) return false;
+	(void)GetCompiled(program);
+	for (uint32_t i = 0; i < NativeAfterWalkers && program.native_code == nullptr; ++i) {
+		SrtWalker warm(program, {});
+	}
+	return program.native_code != nullptr && program.compiled_srt_tried;
 }
 
 bool SrtWalker::EvaluateNative(const SrtNativeValue& value, uint64_t& result) {
@@ -632,7 +709,7 @@ bool SrtWalker::VerifyNative(Value value, bool native_ok, uint64_t native_result
 }
 
 SrtWalker::~SrtWalker() {
-	--m_program.evaluation_depth;
+	--m_session.evaluation_depth;
 }
 
 bool SrtWalker::Evaluate(Value value, uint32_t& result) {
@@ -651,11 +728,23 @@ bool SrtWalker::Evaluate(Value value, uint32_t& result) {
 	return true;
 }
 
-ResourcePlan::EvaluationContext& SrtWalker::AcquireContext(const ResourcePlan& program) {
-	if (program.evaluation_depth == program.evaluation_contexts.size()) {
-		program.evaluation_contexts.emplace_back();
+ResourceEvaluationSession& SrtWalker::SelectSession(const ResourcePlan& program, ResourceEvaluationSession* explicit_session) {
+	EXIT_IF(explicit_session != nullptr &&
+	        (program.native_code == nullptr || !program.compiled_srt_tried));
+	auto& session = explicit_session != nullptr ? *explicit_session : program.evaluation_session;
+	if (session.owner != &program) {
+		EXIT_IF(session.evaluation_depth != 0);
+		session = ResourceEvaluationSession {};
+		session.owner = &program;
 	}
-	auto& context = program.evaluation_contexts[program.evaluation_depth++];
+	return session;
+}
+
+ResourcePlan::EvaluationContext& SrtWalker::AcquireContext(ResourceEvaluationSession& session) {
+	if (session.evaluation_depth == session.evaluation_contexts.size()) {
+		session.evaluation_contexts.emplace_back();
+	}
+	auto& context = session.evaluation_contexts[session.evaluation_depth++];
 	context.generation += 2;
 	return context;
 }
@@ -1351,6 +1440,25 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 	}
 	return false;
 }
+std::optional<size_t> SrtWalker::EvaluateReadonlyBufferGroup(std::span<DescriptorValue> output) {
+	static auto& enabled=Common::LiveSwitches::Get("KYTY_SRT_BUFFER_GROUP",0);
+	if (!enabled.load(std::memory_order_relaxed) || !UseNativeTables() || !NativeBatchEnabled() ||
+	    NativeVerify() || !m_native->HasReadonlyBufferGroup(output.size())) return std::nullopt;
+	const auto& active=m_session.active_sources;
+	uint64_t mask=UINT64_MAX;
+	if (!active.empty()) {
+		mask=0;
+		for (size_t i=0;i<m_program.info.buffers.size();++i) {
+			const auto source=m_program.info.buffers[i].source;
+			if (source>=active.size()) return std::nullopt;
+			if (active[source]) mask|=uint64_t{1}<<i;
+		}
+	}
+	const auto prefix=m_native->EvaluateReadonlyBufferGroup(m_native_frame,m_native_mode,output.data(),mask);
+	EXIT_IF(prefix>output.size());
+	return prefix;
+}
+
 bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 	if (source >= m_program.descriptor_sources.size()) {
 		return false;
@@ -1359,6 +1467,10 @@ bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 	result                 = {};
 	result.dword_count     = descriptor.dword_count;
 	if (UseNativeTables() && descriptor.dword_count <= 8u) {
+		if (NativeBatchEnabled() && !NativeVerify()) {
+			return m_native->EvaluateDescriptor(m_native_frame, m_native_mode, source,
+			                                    result.dwords.data());
+		}
 		const auto* dwords = m_native->DescriptorDwords(source);
 		for (uint32_t index = 0; index < descriptor.dword_count; ++index) {
 			uint64_t wide = 0;
@@ -1409,11 +1521,19 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 	if (!m_program.srt_plan_complete) {
 		return report("SRT plan incomplete", 0, 0, false);
 	}
+	static auto& lazy_refresh = Common::LiveSwitches::Get("KYTY_LAZY_SRT_REFRESH", 1);
+	const bool lazy = lazy_refresh.load(std::memory_order_relaxed) != 0;
 	const auto refresh = [&](uint32_t index) {
 		if (index >= m_program.srt_reads.size()) {
 			return report("read index out of range", index, 0, false);
 		}
 		const auto& read  = m_program.srt_reads[index];
+		if (lazy && !m_program.gpu_flat_slots.empty() && read.flat_offset < m_program.gpu_flat_slots.size() &&
+		    m_program.gpu_flat_slots[read.flat_offset] == 0u) {
+			if (read.flat_offset >= flat.size()) return report("flat slot out of range", index, read.flat_offset, false);
+			flat[read.flat_offset] = 0u;
+			return true;
+		}
 		const bool  clean = read.flat_offset < m_clean_flat_slots.size() &&
 		                   m_clean_flat_slots[read.flat_offset] != 0u;
 		if (clean && (m_clean_evaluator == nullptr || m_runtime.read_specialization_memory == nullptr)) {
@@ -1439,10 +1559,31 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		}
 		return true;
 	};
-	auto& active = m_program.active_sources;
+	auto& active = m_session.active_sources;
+	const bool batch = UseNativeTables() && NativeBatchEnabled() && !NativeVerify() &&
+	                   (lazy || m_program.gpu_flat_slots.empty() ||
+	                    (m_program.native_eager_canonical_code != nullptr &&
+	                     m_native == m_program.native_eager_canonical_code.get())) &&
+	                   (m_runtime.read_specialization_memory != nullptr ||
+	                    std::ranges::none_of(m_clean_flat_slots, [](uint8_t clean) { return clean != 0; }));
+	const auto refresh_block = [&](uint32_t index) {
+		if (batch) {
+			if (!m_native->RefreshBlock(m_native_frame, m_native_mode, index + 1u, flat.data()))
+				return report("native block unreadable", index, 0, false);
+			return true;
+		}
+		for (const auto slot: m_program.control_flow[index].srt_reads)
+			if (!refresh(slot)) return false;
+		return true;
+	};
 	if (m_program.control_flow.empty()) {
 		active.clear();
 		flat.resize(m_program.srt_reads.size());
+		if (batch) {
+			if (!m_native->RefreshBlock(m_native_frame, m_native_mode, 0, flat.data()))
+				return report("native flat buffer unreadable", 0, 0, false);
+			return true;
+		}
 		for (uint32_t index = 0; index < m_program.srt_reads.size(); ++index) {
 			if (!refresh(index)) return false;
 		}
@@ -1476,9 +1617,9 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 	// re-evaluating them reads nothing new); only their scalar reads are refreshed.
 	const bool replay   = predicate.UseNativeTables();
 	bool       replayed = false;
-	if (replay && m_program.active_walk_valid) {
+	if (replay && m_session.active_walk_valid) {
 		replayed = true;
-		for (const auto& [index, outcome]: m_program.active_walk) {
+		for (const auto& [index, outcome]: m_session.active_walk) {
 			if (outcome_of(index) != outcome) {
 				replayed = false;
 				break;
@@ -1486,18 +1627,16 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		}
 		// KYTY_SRT_NATIVE_VERIFY=1 walks anyway and compares below.
 		if (replayed && !NativeVerify()) {
-			for (const auto& [index, outcome]: m_program.active_walk) {
-				for (const auto slot: m_program.control_flow[index].srt_reads) {
-					if (!refresh(slot)) return false;
-				}
+			for (const auto& [index, outcome]: m_session.active_walk) {
+				if (!refresh_block(index)) return false;
 			}
-			active = m_program.active_walk_result;
+			active = m_session.active_walk_result;
 			return true;
 		}
 	}
 	// The sources no block guards are active on every walk: built once per plan, copied per call
 	// (rebuilding it walked every block's sources on every draw; Senaxx 6d02a732).
-	auto& initial = m_program.active_initial;
+	auto& initial = m_session.active_initial;
 	if (initial.size() != m_program.descriptor_sources.size()) {
 		initial.assign(m_program.descriptor_sources.size(), 1u);
 		for (const auto& block: m_program.control_flow) {
@@ -1505,9 +1644,9 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		}
 	}
 	active = initial;
-	auto& visited = m_program.visited_blocks;
-	auto& pending = m_program.pending_blocks;
-	auto& walk    = m_program.active_walk;
+	auto& visited = m_session.visited_blocks;
+	auto& pending = m_session.pending_blocks;
+	auto& walk    = m_session.active_walk;
 	visited.assign(m_program.control_flow.size(), 0u);
 	pending.clear();
 	pending.push_back(0u);
@@ -1519,9 +1658,7 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		visited[index] = 1u;
 		const auto& block = m_program.control_flow[index];
 		for (const auto source: block.sources) active[source] = 1u;
-		for (const auto slot: block.srt_reads) {
-			if (!refresh(slot)) return false;
-		}
+		if (!refresh_block(index)) return false;
 		const auto outcome = outcome_of(index);
 		walk.emplace_back(index, outcome);
 		if (outcome != 2u) {
@@ -1530,13 +1667,13 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 			pending.insert(pending.end(), block.successors.begin(), block.successors.end());
 		}
 	}
-	if (replayed && active != m_program.active_walk_result) {
+	if (replayed && active != m_session.active_walk_result) {
 		EXIT("SRT active sources: a replayed walk differs from the full walk (shader %016" PRIx64
 		     ")\n", m_program.shader_hash);
 	}
 	if (replay) {
-		m_program.active_walk_result = active;
-		m_program.active_walk_valid  = true;
+		m_session.active_walk_result = active;
+		m_session.active_walk_valid  = true;
 	}
 	return true;
 }

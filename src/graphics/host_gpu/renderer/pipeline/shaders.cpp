@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "gpu_tiler_shaders/mesh_indirect_task_spv.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -231,6 +232,7 @@ static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipe
 }
 
 GraphicsPipelineBuild::~GraphicsPipelineBuild() {
+	if (task_shader != nullptr) device.destroyShaderModule(task_shader, nullptr);
 	if (tess_control != nullptr) {
 		device.destroyShaderModule(tess_control, nullptr);
 	}
@@ -287,10 +289,33 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
 	                     (build.tess_control == nullptr || build.tess_eval == nullptr));
 
 	uint32_t shader_stage_count = 0;
+	if (static_params.mesh_task_indirect) {
+		EXIT_IF(!mesh || !graphics.task_shader_enabled);
+		const auto& input = vs_input_info.mesh;
+		const auto& limits = graphics.mesh_shader_properties;
+		build.task_constants = {input.InputPrimitiveSize(), input.InputPrimitiveStep(), input.primitives_per_group,
+		    limits.maxMeshWorkGroupCount[0], limits.maxMeshWorkGroupCount[1], limits.maxMeshWorkGroupTotalCount};
+		for (uint32_t i = 0; i < build.task_entries.size(); ++i)
+			build.task_entries[i] = {i, i * uint32_t(sizeof(uint32_t)), sizeof(uint32_t)};
+		build.task_specialization = {static_cast<uint32_t>(build.task_entries.size()), build.task_entries.data(),
+		    sizeof(build.task_constants), build.task_constants.data()};
+		build.task_shader = CompileSPV(MESH_INDIRECT_TASK_SPV, graphics.device);
+		EXIT_IF(build.task_shader == nullptr);
+		build.stages[shader_stage_count++] = {.stage=vk::ShaderStageFlagBits::eTaskEXT,
+		    .module=build.task_shader, .pName="main", .pSpecializationInfo=&build.task_specialization};
+	}
 	for (uint32_t i = 0; i < vertex_info.size(); i++) {
 		build.stages[shader_stage_count++] = {.stage  = NativeShaderStage(vertex_info[i].logical_stage),
 		                                      .module = programs.vertex[i].module,
 		                                      .pName  = "main"};
+		if (mesh && graphics.task_shader_enabled &&
+		    vertex_info[i].logical_stage == ShaderType::Mesh) {
+			build.mesh_uses_task_payload = static_params.mesh_task_indirect ? 1u : 0u;
+			build.mesh_task_entry = {ShaderRecompiler::IR::PushData::MeshTaskSpecializationId, 0, sizeof(uint32_t)};
+			build.mesh_task_specialization = {1, &build.mesh_task_entry,
+			    sizeof(build.mesh_uses_task_payload), &build.mesh_uses_task_payload};
+			build.stages[shader_stage_count-1].pSpecializationInfo = &build.mesh_task_specialization;
+		}
 	}
 	if (rect_list) {
 		build.stages[shader_stage_count++] = {.stage  = vk::ShaderStageFlagBits::eTessellationControl,
@@ -455,6 +480,7 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
 
 	std::vector<vk::DescriptorSetLayoutBinding> descriptor_bindings;
 	vk::ShaderStageFlags graphics_stages = vk::ShaderStageFlagBits::eFragment;
+	if (mesh && graphics.task_shader_enabled) graphics_stages |= vk::ShaderStageFlagBits::eTaskEXT;
 	for (const auto& stage: vertex_info) {
 		const auto native_stage = NativeShaderStage(stage.logical_stage);
 		AddLayoutBindings(descriptor_bindings, *stage.stage.program, native_stage);
@@ -530,6 +556,9 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
 #endif
 	if (graphics.attachment_feedback_loop_enabled) {
 		build.dynamic_states.push_back(vk::DynamicState::eAttachmentFeedbackLoopEnableEXT);
+	}
+	if (graphics.fragment_shading_rate_2x2_enabled) {
+		build.dynamic_states.push_back(vk::DynamicState::eFragmentShadingRateKHR);
 	}
 
 	build.dynamic_state.dynamicStateCount = static_cast<uint32_t>(build.dynamic_states.size());

@@ -577,7 +577,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			FullMemoryBarrier(vk_buffer);
 		}
 		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+		const bool gpu_compute_sample = m_context.GetCommandScheduler().BeginGpuComputeSample(
+		    buffer, program.shader_hash);
 		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+		if (gpu_compute_sample) {
+			m_context.GetCommandScheduler().EndGpuComputeSample(buffer);
+		}
 
 		// The removed host fence also ordered read-only dispatches before later writers.
 		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
@@ -675,7 +680,12 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 			FullMemoryBarrier(vk_buffer);
 		}
 		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+		const bool gpu_compute_sample = m_context.GetCommandScheduler().BeginGpuComputeSample(
+		    buffer, program.shader_hash);
 		vk_buffer.dispatchIndirect(indirect_buffer, indirect_offset);
+		if (gpu_compute_sample) {
+			m_context.GetCommandScheduler().EndGpuComputeSample(buffer);
+		}
 		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	} while (recovery.Retry());
 	ResetBindings();

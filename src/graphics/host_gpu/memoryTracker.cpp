@@ -11,6 +11,7 @@ static_assert(std::atomic<void*>::is_always_lock_free);
 MemoryTracker::MemoryTracker(PageManager& page_manager): m_page_manager(page_manager) {
 	m_regions          = std::make_unique<std::atomic<RegionManager*>[]>(REGION_COUNT);
 	m_cpu_summary_bits = std::make_unique<std::atomic<uint64_t>[]>(SUMMARY_WORDS);
+	m_region_presence_bits = std::make_unique<std::atomic<uint64_t>[]>(SUMMARY_WORDS);
 }
 
 bool MemoryTracker::UseRegionBitmap() {
@@ -20,6 +21,28 @@ bool MemoryTracker::UseRegionBitmap() {
 }
 
 MemoryTracker::~MemoryTracker() = default;
+
+bool MemoryTracker::UseRegionInitBitmap() {
+	static auto& enabled = Common::LiveSwitches::Get("KYTY_REGION_INIT_BITMAP", 0);
+	return enabled.load(std::memory_order_relaxed) != 0;
+}
+
+void MemoryTracker::EnsureRegions(uint64_t vaddr, uint64_t size) {
+	ValidateRange(vaddr, size);
+	if (size == 0) return;
+	const uint64_t first = vaddr / TRACKER_REGION_SIZE;
+	const uint64_t last = (vaddr + size - 1u) / TRACKER_REGION_SIZE;
+	for (uint64_t word = first / 64; word <= last / 64; ++word) {
+		uint64_t missing = ~m_region_presence_bits[word].load(std::memory_order_acquire);
+		if (word == first / 64) missing &= ~uint64_t {0} << (first % 64);
+		if (word == last / 64 && last % 64 != 63) missing &= (uint64_t {1} << (last % 64 + 1)) - 1;
+		while (missing != 0) {
+			const auto bit = static_cast<uint64_t>(std::countr_zero(missing));
+			missing &= missing - 1;
+			(void)GetOrCreateRegion(word * 64 + bit);
+		}
+	}
+}
 
 #if KYTY_BUILD == KYTY_BUILD_DEBUG
 void MemoryTracker::ValidateGpuDirtyPages(const RangeSet& dirty, uint64_t vaddr, uint64_t size,
@@ -73,6 +96,7 @@ RegionManager* MemoryTracker::GetOrCreateRegion(uint64_t index) {
 	ptr->SetCpuSummaryBit(&m_cpu_summary_bits[index / 64], uint64_t {1} << (index % 64));
 	m_region_storage.push_back(std::move(manager));
 	m_regions[index].store(ptr, std::memory_order_release);
+	m_region_presence_bits[index / 64].fetch_or(uint64_t {1} << (index % 64), std::memory_order_release);
 	return ptr;
 }
 

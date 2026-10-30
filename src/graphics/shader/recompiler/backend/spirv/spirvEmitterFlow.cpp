@@ -697,11 +697,35 @@ uint32_t EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (state.program.stage != ShaderType::Mesh || index >= IR::PushData::MeshDrawDwordCount) {
 		ctx.Fail(inst, "invalid mesh draw parameter");
 	}
-	const auto pointer = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state), pointer,
-	                          state.push_constant_variable, ConstantU32(state, 0),
-	                          ConstantU32(state, index));
-	state.builder.AddFunction(spv::OpLoad, TypeU32(state), result, pointer);
+	const auto load_push = [&](uint32_t slot) {
+		const auto pointer = state.builder.AllocateId();
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state), pointer,
+		                          state.push_constant_variable, ConstantU32(state, 0),
+		                          ConstantU32(state, slot));
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+		return value;
+	};
+	const auto direct = load_push(index);
+	if (!MeshIndirectParameters(state)) return direct;
+	// Task presence is part of the pipeline key. Specialization lets the driver
+	// remove the other path instead of testing a push flag for each parameter/lane.
+	const auto indirect = state.task_payload_enabled;
+	uint32_t value = ConstantU32(state, 0);
+	if (index < 3u) {
+		// Direct pipelines have no task producer. Never execute a payload load on
+		// that path, even though the same mesh module declares the interface.
+		value = EmitValueOrZeroIfCondition(state, indirect, [&] {
+			const auto pointer = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpAccessChain,
+			    TypePointer(state, spv::StorageClassTaskPayloadWorkgroupEXT, TypeU32(state)), pointer,
+			    state.task_payload_variable, ConstantU32(state, index));
+			const auto loaded = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpLoad, TypeU32(state), loaded, pointer);
+			return loaded;
+		});
+	}
+	state.builder.AddFunction(spv::OpSelect, TypeU32(state), result, indirect, value, direct);
 	return result;
 }
 

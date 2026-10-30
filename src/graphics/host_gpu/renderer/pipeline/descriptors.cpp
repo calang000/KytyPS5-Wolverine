@@ -1636,12 +1636,11 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			}
 		}
 	}
-	m_descriptor_buffers.clear();
 	m_descriptor_images.clear();
 	m_descriptor_writes.clear();
-	m_descriptor_buffers.reserve(descriptor_count);
 	m_descriptor_images.reserve(descriptor_count);
 	m_descriptor_writes.reserve(write_count);
+	std::array<vk::DescriptorBufferInfo, 2> address_buffers;
 
 	for (auto* prepared: prepared_bindings) {
 		const auto& program       = *prepared->runtime->program;
@@ -1758,7 +1757,6 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			write.dstBinding     = ShaderRecompiler::IR::NativeBinding(program.stage, binding.kind);
 			write.descriptorType = NativeDescriptorType(binding.kind);
 			write.descriptorCount   = NativeDescriptorCount(binding);
-			const auto buffer_start = m_descriptor_buffers.size();
 			const auto image_start  = m_descriptor_images.size();
 			if (ShaderRecompiler::IR::ImageBindingResourceClass(binding.kind) !=
 			    ShaderRecompiler::IR::ImageResourceClass::None) {
@@ -1817,8 +1815,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 						EXIT_IF(descriptors.buffers.size() != binding.resources.size());
 						for (const auto& view: descriptors.buffers) {
 							EXIT_IF(view.buffer == nullptr);
-							m_descriptor_buffers.push_back(view);
 						}
+						write.pBufferInfo = descriptors.buffers.data();
 						break;
 					case BindingKind::BdaPagetable:
 					case BindingKind::FaultBuffer: {
@@ -1826,8 +1824,9 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 						const auto* bda_buffer = binding.kind == BindingKind::BdaPagetable
 						                             ? cache.GetBdaPageTableBuffer()
 						                             : cache.GetFaultBuffer();
-						m_descriptor_buffers.emplace_back(bda_buffer->Handle(), 0,
-						                                  bda_buffer->Size());
+						auto& view = address_buffers[binding.kind == BindingKind::FaultBuffer];
+						view = {bda_buffer->Handle(), 0, bda_buffer->Size()};
+						write.pBufferInfo = &view;
 						break;
 					}
 					case BindingKind::FlattenedSrt:
@@ -1840,7 +1839,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 							view = &descriptors.shader_data_buffer;
 						}
 						EXIT_IF(view->buffer == nullptr);
-						m_descriptor_buffers.push_back(*view);
+						write.pBufferInfo = view;
 						break;
 					}
 					case BindingKind::Samplers:
@@ -1853,9 +1852,6 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 						break;
 					case BindingKind::Count: EXIT("invalid descriptor binding kind");
 				}
-			}
-			if (m_descriptor_buffers.size() != buffer_start) {
-				write.pBufferInfo = m_descriptor_buffers.data() + buffer_start;
 			}
 			if (m_descriptor_images.size() != image_start) {
 				write.pImageInfo = m_descriptor_images.data() + image_start;
@@ -1880,6 +1876,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	}
 
 	if (has_push_data) {
+		if (m_context.GetGraphics().task_shader_enabled && (push_stages & vk::ShaderStageFlagBits::eMeshEXT))
+			push_stages |= vk::ShaderStageFlagBits::eTaskEXT;
 		vk_buffer.pushConstants(pipeline.pipeline_layout, push_stages, 0, sizeof(push_data),
 		                        push_data.dwords.data());
 	}

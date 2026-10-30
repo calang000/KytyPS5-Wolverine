@@ -13,6 +13,7 @@
 #include <fmt/format.h>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <mutex>
 #include <numeric>
@@ -903,6 +904,56 @@ private:
 		}
 	}
 
+	// Data-only scalar constants need no host specialization. Bind their original guest bytes
+	// as a small readonly buffer and execute the load in the shader, instead of reading every
+	// DWORD on the CPU and uploading the flattened result back to the GPU on every draw.
+	bool LowerGpuScalarConstant(Inst& read) {
+		static const bool enabled = [] {
+			const char* value = std::getenv("KYTY_GPU_SCALAR_CONSTANTS");
+			return value != nullptr && std::strcmp(value, "1") == 0;
+		}();
+		if (!enabled || m_srt_visited.contains(&read)) return false;
+		uint32_t memory_index = 0;
+		const auto* original = ScalarReadMemory(read, memory_index);
+		if (original == nullptr || original->kind != ResourceKind::ScalarAddress ||
+		    static_cast<int32_t>(original->offset) < 0) return false;
+		const auto offset = read.Arg(1).Resolve();
+		if (!offset.IsImmediate() || offset.GetType() != Type::U32) return false;
+		constexpr uint32_t Range = 16u << 10u;
+		if (uint64_t(offset.U32() & ~3u) + (original->offset & ~3u) + 4u > Range) return false;
+		const auto* handle = read.Arg(0).Resolve().TryInstruction();
+		if (handle == nullptr || handle->GetOpcode() != ValueOpcode::GetAddressResource ||
+		    handle->NumArgs() != 2u) return false;
+		const auto same_root = std::ranges::find_if(m_gpu_scalar_handles, [&](const Inst* prior) {
+			return EquivalentValue(m_program, prior->Arg(0), handle->Arg(0)) &&
+			       EquivalentValue(m_program, prior->Arg(1), handle->Arg(1));
+		});
+		if (same_root == m_gpu_scalar_handles.end()) {
+			if (m_gpu_scalar_handles.size() >= 8u) return false;
+			m_gpu_scalar_handles.push_back(handle);
+		}
+		auto* block = read.Parent();
+		const auto where = std::ranges::find_if(block->Instructions(), [&](const Inst& inst) { return &inst == &read; });
+		const auto low = Value(&*block->PrependNewInst(where, ValueOpcode::BitwiseAnd32,
+		    {handle->Arg(0), Value(~3u)}));
+		const auto high = Value(&*block->PrependNewInst(where, ValueOpcode::BitwiseAnd32,
+		    {handle->Arg(1), Value(0xffffu)}));
+		const auto buffer = Value(&*block->PrependNewInst(where, ValueOpcode::GetBufferResource,
+		    {low, high, Value(Range), Value(0u)}));
+		auto memory = *original;
+		memory.kind = ResourceKind::ScalarBuffer;
+		memory.planning_only = false;
+		const auto index = static_cast<uint32_t>(m_program.memory_info.size());
+		m_program.memory_info.push_back(memory);
+		auto flags = read.Flags<MemoryFlags>(); flags.index = index;
+		const auto replacement = block->PrependNewInst(where, ValueOpcode::ReadConstBuffer,
+		    {buffer, read.Arg(1)});
+		replacement->SetFlags(flags);
+		read.ReplaceUsesWith(Value(&*replacement));
+		++m_gpu_scalar_lowered;
+		return true;
+	}
+
 	void PlanScalarReads() {
 		m_program.srt_plan_complete = false;
 		m_program.srt_reads.clear();
@@ -946,11 +997,16 @@ private:
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
 				uint32_t index = 0;
+				if (inst.GetOpcode() == ValueOpcode::LoadAddressU32 && LowerGpuScalarConstant(inst)) continue;
 				if (inst.GetOpcode() == ValueOpcode::LoadAddressU32 &&
 				    ScalarReadMemory(inst, index) != nullptr && inst.Arg(1).Resolve().IsImmediate() &&
 				    ValidateRuntimeValue(m_program, Value(&inst)))
 					CollectScalarRead(Value(&inst), inst.Flags<MemoryFlags>().pc);
 			}
+		}
+		if (m_gpu_scalar_lowered != 0) {
+			std::printf("%s\n", fmt::format("GPU scalar constants: shader {:016x} moved {} reads from host to {} readonly roots",
+			            m_program.shader_hash, m_gpu_scalar_lowered, m_gpu_scalar_handles.size()).c_str());
 		}
 		for (auto* read: m_scalar_reads) {
 			const auto flags = read->Flags<MemoryFlags>();
@@ -3227,6 +3283,8 @@ private:
 	std::vector<ResolvedHandle>                m_resolved_handles;
 	std::unordered_set<const Inst*>            m_srt_visited;
 	std::vector<Inst*>                         m_scalar_reads;
+	std::vector<const Inst*>                   m_gpu_scalar_handles;
+	uint32_t                                   m_gpu_scalar_lowered = 0;
 	ShaderInfo                                 m_info;
 	std::vector<DescriptorSource>              m_sources;
 	std::vector<HandlePatch>                   m_handle_patches;

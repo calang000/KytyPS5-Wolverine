@@ -1,5 +1,6 @@
 #include "graphics/shader/recompiler/frontend/decode/ShaderFunctions.h"
 
+#include "common/profiler.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/shaderBindings.h"
 
@@ -688,8 +689,14 @@ bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t bas
 		return false;
 	}
 	auto& shader = m_impl->shaders[reinterpret_cast<uint64_t>(code.data())];
-	if (shader.analysis.code.size() != code.size() ||
-	    !std::equal(code.begin(), code.end(), shader.analysis.code.begin())) {
+	bool code_changed = false;
+	{
+		KYTY_PROFILER_BLOCK("ShaderFunctions::CompareCode");
+		code_changed = shader.analysis.code.size() != code.size() ||
+		               !std::equal(code.begin(), code.end(), shader.analysis.code.begin());
+	}
+	if (code_changed) {
+		KYTY_PROFILER_BLOCK("ShaderFunctions::AnalyzeShader");
 		shader = {};
 		AnalyzeShader(code, shader.analysis);
 	}
@@ -701,10 +708,14 @@ bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t bas
 	}
 	std::vector<CallSite> sites;
 	std::set<uint32_t>    dependencies;
-	if (!ResolveCalls(analysis, base, user_data, read, wave_size, sites, dependencies, reason)) {
-		return false;
+	{
+		KYTY_PROFILER_BLOCK("ShaderFunctions::ResolveCalls");
+		if (!ResolveCalls(analysis, base, user_data, read, wave_size, sites, dependencies, reason)) {
+			return false;
+		}
 	}
 	for (const auto& expansion: shader.expansions) {
+		KYTY_PROFILER_BLOCK("ShaderFunctions::CheckExpansion");
 		if (expansion.base == base && expansion.wave_size == wave_size &&
 		    expansion.user_data_count == user_data.size() && expansion.sites == sites &&
 		    m_impl->StillReads(expansion, read)) {
@@ -724,8 +735,11 @@ bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t bas
 		    .emplace_back(address, std::vector<uint32_t>(words.begin(), words.end()));
 		return ok;
 	};
-	expansion.ok = BuildExpansion(analysis, base, expansion.sites, dependencies, recording,
-	                              wave_size, expansion.code, expansion.reason);
+	{
+		KYTY_PROFILER_BLOCK("ShaderFunctions::BuildExpansion");
+		expansion.ok = BuildExpansion(analysis, base, expansion.sites, dependencies, recording,
+		                              wave_size, expansion.code, expansion.reason);
+	}
 	MergeReads(expansion.reads);
 	expanded = expansion.code;
 	reason   = expansion.reason;

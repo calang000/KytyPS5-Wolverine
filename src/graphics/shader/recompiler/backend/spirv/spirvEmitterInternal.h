@@ -128,6 +128,8 @@ struct EmitterState {
 	uint32_t                                         gds_variable            = 0;
 	uint32_t                                         gds_length              = 0;
 	uint32_t                                         push_constant_variable  = 0;
+	uint32_t                                         task_payload_variable = 0;
+	uint32_t                                         task_payload_enabled = 0;
 	uint32_t                                         shader_data_storage_variable = 0;
 	uint32_t                                         flattened_srt_variable  = 0;
 	uint32_t                                         lds_variable            = 0;
@@ -425,6 +427,7 @@ uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index);
 
 // A thread-dimension compute dispatch whose counts the shader reads from GPU memory.
 [[nodiscard]] bool DispatchDimensionsIndirect(const EmitterState& state);
+[[nodiscard]] bool MeshIndirectParameters(const EmitterState& state);
 // Guest DMA, or DispatchDimensionsIndirect: the module uses physical storage buffer pointers.
 [[nodiscard]] bool UsesPhysicalAddresses(const EmitterState& state);
 

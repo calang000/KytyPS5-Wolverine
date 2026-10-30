@@ -8,6 +8,8 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
+#include "graphics/shader/recompiler/ir/passes/SrtNative.h"
+#include "common/liveSwitches.h"
 
 #include <array>
 #include <bit>
@@ -3715,8 +3717,95 @@ void TestMalformedMemoryKindsRejected() {
 
 } // namespace
 
+void TestLazySrtFlat() {
+  Fixture fixture;
+  const auto base = fixture.Address(fixture.UserData(0), fixture.UserData(1), 4);
+  MemoryInfo scalar; scalar.kind = ResourceKind::ScalarAddress;
+  const auto pointer = fixture.Emit(ValueOpcode::LoadAddressU32,
+      {base, Value(0u), Value(0u), Value(true)}, fixture.AddMemory(scalar, 4));
+  const auto payload = fixture.Emit(ValueOpcode::LoadAddressU32,
+      {base, Value(4u), Value(0u), Value(true)}, fixture.AddMemory(scalar, 8));
+  fixture.Emit(ValueOpcode::ReferenceU32, {payload});
+  const auto handle = fixture.Buffer({pointer, Value(0u), Value(64u), Value(0u)}, 12);
+  MemoryInfo buffer; buffer.kind = ResourceKind::Buffer;
+  fixture.Emit(ValueOpcode::LoadBufferU32,
+      {handle, Value(0u), Value(0u), Value(0u), Value(true)}, fixture.AddMemory(buffer, 12));
+  fixture.PlanAndTrack();
+  auto plan = ExtractResourcePlan(fixture.program);
+  Check(plan.srt_reads.size() == 2 && plan.gpu_flat_slots == std::vector<uint8_t>({0, 1}),
+        "lazy SRT classified descriptor payload or GPU data incorrectly");
+  TestMemory memory; memory.words[0] = 0xcafeu; memory.words[1] = 0xbeefu;
+  std::array<uint32_t, 2> user {0x1000u, 0u};
+  ResourceSnapshot snapshot; ResourceSpecialization specialization;
+  plan.native_code = SrtNativeCode::Compile(plan);
+  Check(plan.native_code != nullptr, "lazy native plan did not compile");
+  for (int batch: {0, 1}) for (int lazy: {0, 1}) {
+    Common::LiveSwitches::Get("KYTY_SRT_NATIVE_BATCH", 0).store(batch);
+    Common::LiveSwitches::Get("KYTY_LAZY_SRT_REFRESH", 1).store(lazy);
+    Check(MaterializeResources(plan, {.user_data = user, .read_memory = ReadTestMemory,
+            .userdata = &memory}, snapshot, specialization), "lazy descriptor materialization failed");
+    Check(snapshot.flattened_srt == std::vector<uint32_t>({lazy ? 0u : 0xcafeu, 0xbeefu}) &&
+          snapshot.buffers.size() == 1 && snapshot.buffers[0].dwords[0] == 0xcafeu,
+          "lazy descriptor lost its host value or changed GPU data");
+  }
+  auto host_only = ExtractResourcePlan(fixture.program);
+  host_only.gpu_flat_slots.assign(2, 0u);
+  host_only.native_code = SrtNativeCode::Compile(host_only);
+  memory.reads = 0;
+  std::vector<uint32_t> flat;
+  SrtWalker walker(host_only, {.user_data = user, .read_memory = ReadTestMemory, .userdata = &memory});
+  Check(walker.RefreshFlatBuffer(flat) && flat == std::vector<uint32_t>({0u, 0u}) && memory.reads == 0,
+        "host-only slots were read eagerly");
+}
+
+void TestGpuScalarConstants() {
+  Fixture fixture;
+  const auto base = fixture.Address(fixture.UserData(0), fixture.UserData(1), 4);
+  MemoryInfo scalar; scalar.kind = ResourceKind::ScalarAddress; scalar.offset = 4;
+  for (uint32_t offset: {0u, 4u, 8u})
+    fixture.Emit(ValueOpcode::LoadAddressU32, {base, Value(offset), Value(0u), Value(true)},
+                 fixture.AddMemory(scalar, 4 + offset));
+  fixture.PlanAndTrack();
+  Check(fixture.program.resource_tracking_complete && fixture.program.srt_reads.empty(),
+        "data-only constants still require host reads");
+  Check(fixture.program.info.buffers.size() == 1 && !fixture.program.info.uses_dma,
+        "constant loads did not coalesce into one bounded readonly buffer");
+  uint32_t loads = 0;
+  for (const auto& inst: *fixture.block) if (inst.GetOpcode() == ValueOpcode::ReadConstBuffer) ++loads;
+  Check(loads == 3, "constant loads were lost during lowering");
+  TestMemory memory;
+  std::array<uint32_t, 2> user {0x1003u, 0xabcd1234u};
+  ResourceSnapshot snapshot; ResourceSpecialization specialization;
+  auto plan = ExtractResourcePlan(fixture.program);
+  Check(MaterializeResources(plan, {.user_data = user, .read_memory = ReadTestMemory,
+          .userdata = &memory}, snapshot, specialization), "constant buffer failed materialization");
+  Check(memory.reads == 0 && snapshot.buffers.size() == 1 &&
+        snapshot.buffers[0].dwords[0] == 0x1000u && snapshot.buffers[0].dwords[1] == 0x1234u &&
+        snapshot.buffers[0].dwords[2] == 16384u,
+        "constant buffer changed address alignment or read payload on host");
+  TestSrtFlatteningAndRuntimeMemoization(); // Descriptor dependencies must retain the old host path.
+  for (uint32_t offset: {16384u, 0xfffffffcu}) {
+    Fixture fallback;
+    const auto address = fallback.Address(fallback.UserData(0), fallback.UserData(1), 4);
+    fallback.Emit(ValueOpcode::LoadAddressU32, {address, Value(offset), Value(0u), Value(true)},
+                   fallback.AddMemory(scalar, 4));
+    fallback.PlanAndTrack();
+    Check(fallback.program.srt_reads.size() == 1, "unsupported range did not keep host fallback");
+  }
+}
+
 int main() {
   try {
+    if (const char* lazy = std::getenv("KYTY_LAZY_SRT_FLAT"); lazy && std::string_view(lazy) == "1") {
+      TestLazySrtFlat();
+      std::cout << "Lazy SRT flat tracking tests passed\n";
+      return 0;
+    }
+    if (const char* gpu = std::getenv("KYTY_GPU_SCALAR_CONSTANTS"); gpu && std::string_view(gpu) == "1") {
+      TestGpuScalarConstants();
+      std::cout << "GPU scalar constant tracking tests passed\n";
+      return 0;
+    }
     const auto Run = [](const char *name, auto test) {
       try {
         test();

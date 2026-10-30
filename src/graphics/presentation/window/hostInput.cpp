@@ -11,13 +11,38 @@
 #include <array>
 #include <cmath>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <string_view>
 
 namespace Libs::Graphics {
 
 namespace {
+
+bool ExclusiveDiagnosticPad() {
+	static const bool enabled = [] {
+		const char* file = std::getenv("KYTY_TEST_PAD_FILE");
+		const char* exclusive = std::getenv("KYTY_TEST_PAD_EXCLUSIVE");
+		return file != nullptr && *file != '\0' && exclusive != nullptr && std::strcmp(exclusive, "1") == 0;
+	}();
+	return enabled;
+}
+
+bool PhysicalGameInput(uint32_t type) {
+	switch (type) {
+		case SDL_EVENT_KEY_DOWN: case SDL_EVENT_KEY_UP:
+		case SDL_EVENT_TEXT_INPUT: case SDL_EVENT_TEXT_EDITING:
+		case SDL_EVENT_MOUSE_MOTION: case SDL_EVENT_MOUSE_BUTTON_DOWN:
+		case SDL_EVENT_MOUSE_BUTTON_UP: case SDL_EVENT_MOUSE_WHEEL:
+		case SDL_EVENT_GAMEPAD_AXIS_MOTION: case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+		case SDL_EVENT_GAMEPAD_BUTTON_UP: case SDL_EVENT_GAMEPAD_TOUCHPAD_DOWN:
+		case SDL_EVENT_GAMEPAD_TOUCHPAD_MOTION: case SDL_EVENT_GAMEPAD_TOUCHPAD_UP:
+		case SDL_EVENT_GAMEPAD_SENSOR_UPDATE: return true;
+		default: return false; // window close/quit and device connection events remain available
+	}
+}
 
 struct ControlInfo {
 	std::string_view name;
@@ -403,6 +428,7 @@ bool IsCursorActivity(const SDL_Event& event) {
 } // namespace
 
 void HostInputInit(SDL_Window* window) {
+	if (ExclusiveDiagnosticPad()) std::printf("Diagnostic input: synthetic-only; physical game inputs ignored\n");
 	GetInputMap();
 	g_mouse_window = window;
 	if (Config::HideCursorEnabled()) {
@@ -457,7 +483,66 @@ void HostInputToggleMouseToJoystick() {
 
 bool HostInputWaitEvent(SDL_Event* event) {
 	int timeout = -1;
-	if (!g_mouse.enabled || SDL_GetKeyboardFocus() != g_mouse_window) {
+	// Diagnostic builds can receive a held pad button through a local command file.
+	// A synthetic key press is otherwise too short for some games' pad polling loop.
+	static const char* test_pad_file = std::getenv("KYTY_TEST_PAD_FILE");
+	static uint32_t    test_button   = 0;
+	static bool        test_stick    = false;
+	static uint64_t    release_at    = 0;
+	if (test_pad_file != nullptr && *test_pad_file != '\0') {
+		const auto now = SDL_GetTicks();
+		if (test_stick && now >= release_at) {
+			SetStickAxis(Controller::Axis::LeftX, false, false);
+			SetStickAxis(Controller::Axis::LeftY, false, false);
+			test_stick = false;
+		}
+		if (test_button != 0 && now >= release_at) {
+			SetButton(test_button, false);
+			test_button = 0;
+		}
+		if (test_button == 0 && !test_stick) {
+			if (auto* file = std::fopen(test_pad_file, "r"); file != nullptr) {
+				char command[32] {};
+				const bool read = std::fgets(command, sizeof(command), file) != nullptr;
+				std::fclose(file);
+				std::remove(test_pad_file);
+				if (read) {
+					if (std::strncmp(command, "quit", 4) == 0) {
+						*event = SDL_Event {};
+						event->type = SDL_EVENT_QUIT;
+						return true;
+					}
+					int x = 0, y = 0;
+					unsigned duration = 0;
+					if (std::sscanf(command, "walk %d %d %u", &x, &y, &duration) == 3 &&
+					    x >= -1 && x <= 1 && y >= -1 && y <= 1 && duration >= 100 && duration <= 10000) {
+						SetStickAxis(Controller::Axis::LeftX, x < 0, x > 0);
+						SetStickAxis(Controller::Axis::LeftY, y < 0, y > 0);
+						test_stick = true;
+						release_at = now + duration;
+					} else if (std::strncmp(command, "attack", 6) == 0) {
+						test_button = Controller::PAD_BUTTON_SQUARE;
+					} else if (std::strncmp(command, "dodge", 5) == 0) {
+						test_button = Controller::PAD_BUTTON_CIRCLE;
+					} else if (std::strncmp(command, "cross", 5) == 0) {
+						test_button = Controller::PAD_BUTTON_CROSS;
+					} else if (std::strncmp(command, "options", 7) == 0) {
+						test_button = Controller::PAD_BUTTON_OPTIONS;
+					} else if (std::strncmp(command, "down", 4) == 0) {
+						test_button = Controller::PAD_BUTTON_DOWN;
+					} else if (std::strncmp(command, "up", 2) == 0) {
+						test_button = Controller::PAD_BUTTON_UP;
+					}
+					if (test_button != 0) {
+						SetButton(test_button, true);
+						release_at = now + 300;
+					}
+				}
+			}
+		}
+		timeout = 50;
+	}
+	if (ExclusiveDiagnosticPad() || !g_mouse.enabled || SDL_GetKeyboardFocus() != g_mouse_window) {
 		g_mouse.next_poll = 0;
 		CenterMouseStick();
 	} else {
@@ -465,7 +550,10 @@ bool HostInputWaitEvent(SDL_Event* event) {
 			SDL_GetRelativeMouseState(nullptr, nullptr);
 			g_mouse.next_poll = SDL_GetTicks() + MOUSE_POLL_INTERVAL_MS;
 		}
-		timeout = PollMouse(SDL_GetTicks());
+		const int mouse_timeout = PollMouse(SDL_GetTicks());
+		if (mouse_timeout >= 0) {
+			timeout = timeout < 0 ? mouse_timeout : std::min(timeout, mouse_timeout);
+		}
 	}
 
 	if (g_cursor_hide_at != 0) {
@@ -475,6 +563,7 @@ bool HostInputWaitEvent(SDL_Event* event) {
 		timeout = timeout < 0 ? cursor_timeout : std::min(timeout, cursor_timeout);
 	}
 	const bool has_event = SDL_WaitEventTimeout(event, timeout);
+	if (has_event && ExclusiveDiagnosticPad() && PhysicalGameInput(event->type)) return false;
 
 	if (Config::HideCursorEnabled()) {
 		const auto now_ms = SDL_GetTicks();

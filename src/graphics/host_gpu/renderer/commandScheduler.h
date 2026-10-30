@@ -39,6 +39,12 @@ public:
 	void           Finish();
 	CommandBuffer& BeginCommand();
 	uint64_t       Submit(SubmitInfo submit = {});
+	// Samples one in sixteen Vulkan draws when KYTY_GPU_DRAW_PROFILE=1 and recording is inline.
+	[[nodiscard]] bool BeginGpuDrawSample(CommandBuffer& buffer, uint64_t pixel_shader_hash);
+	void               EndGpuDrawSample(CommandBuffer& buffer);
+	// Samples compute dispatches with the same Vulkan timestamp pool as draw profiling.
+	[[nodiscard]] bool BeginGpuComputeSample(CommandBuffer& buffer, uint64_t shader_hash);
+	void               EndGpuComputeSample(CommandBuffer& buffer);
 	// Deferred callbacks can observe an externally owned drain, but cannot initiate shutdown:
 	// the priority runner cannot join itself.
 	void                      Shutdown();

@@ -226,7 +226,7 @@ void RenderContext::DispatchFault(PageFaultAccess access, uint64_t fault_vaddr) 
 	const auto         start      = stats ? std::chrono::steady_clock::now()
 	                                      : std::chrono::steady_clock::time_point {};
 	if (access == PageFaultAccess::Write) {
-		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
+		m_buffer_cache.InvalidateCpuWriteFault(fault_vaddr);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 	} else {
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);

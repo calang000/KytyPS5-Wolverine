@@ -4,6 +4,7 @@
 #include "graphics/host_gpu/rangeSet.h"
 
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -299,6 +300,91 @@ void TestRangeSet() {
         "range set subtraction did not preserve both exact tails");
 }
 
+void TestRangeSetAgainstCoverage() {
+  // Independent byte coverage model: exercise merges, contained additions,
+  // prefix/suffix cuts and splits at low and high guest addresses.
+  for (int reuse : {0, 1, 2}) {
+   Common::LiveSwitches::Get("KYTY_RANGE_NODE_REUSE", 0).store(reuse == 0 ? 0 : 1);
+   for (uint64_t base : {uint64_t{0}, uint64_t{1} << 40, UINT64_MAX - 1024}) {
+    RangeSet ranges;
+    std::array<bool, 512> coverage{};
+    uint32_t random = 0x23918a57u;
+    const auto next = [&] {
+      random ^= random << 13;
+      random ^= random >> 17;
+      random ^= random << 5;
+      return random;
+    };
+    for (unsigned trial = 0; trial < 4000; ++trial) {
+      if (reuse == 2) Common::LiveSwitches::Get("KYTY_RANGE_NODE_REUSE", 0).store((trial / 13) & 1);
+      const uint32_t start = next() % coverage.size();
+      const uint32_t size = std::min<uint32_t>(1 + next() % 96, coverage.size() - start);
+      const bool add = (next() & 1u) != 0;
+      if (add) ranges.Add(base + start, size);
+      else ranges.Subtract(base + start, size);
+      std::fill_n(coverage.begin() + start, size, add);
+      std::array<bool, 512> actual{};
+      uint64_t previous = base;
+      bool first = true;
+      ranges.ForEach([&](uint64_t begin, uint64_t end) {
+        Check(begin >= base && begin < end && end <= base + coverage.size(),
+              "range set escaped modeled coverage");
+        Check(first || previous < begin, "range set left touching/overlapping intervals");
+        std::fill(actual.begin() + (begin - base), actual.begin() + (end - base), true);
+        previous = end;
+        first = false;
+      });
+      Check(actual == coverage, "range set differs from independent byte coverage");
+      const uint32_t query = next() % coverage.size();
+      const uint32_t length = std::min<uint32_t>(1 + next() % 32, coverage.size() - query);
+      const auto begin = coverage.begin() + query, end = begin + length;
+      Check(ranges.Contains(base + query, length) == std::all_of(begin, end, [](bool v){return v;}),
+            "range containment differs from independent coverage");
+      Check(ranges.Intersects(base + query, length) == std::any_of(begin, end, [](bool v){return v;}),
+            "range intersection differs from independent coverage");
+    }
+    RangeSet copied = ranges;
+    RangeSet assigned;
+    assigned = ranges;
+    ranges.Clear();
+    RangeSet moved = std::move(copied);
+    for (uint32_t index = 0; index < coverage.size(); ++index) {
+      Check(moved.Contains(base + index, 1) == coverage[index] &&
+            assigned.Contains(base + index, 1) == coverage[index],
+            "range copy/move shared node ownership or changed coverage");
+    }
+   }
+  }
+  Common::LiveSwitches::Get("KYTY_RANGE_NODE_REUSE", 0).store(0);
+}
+
+void BenchmarkRangeNodeReuse() {
+  constexpr uint64_t base = uint64_t{1} << 40;
+  constexpr uint64_t span = 0x100000;
+  constexpr unsigned iterations = 500000;
+  for (const char* pattern : {"contained", "prefix", "split"}) {
+    for (int reuse : {0, 1, 0, 1}) {
+      Common::LiveSwitches::Get("KYTY_RANGE_NODE_REUSE", 0).store(reuse);
+      RangeSet ranges;
+      ranges.Add(base, span);
+      const auto start = std::chrono::steady_clock::now();
+      for (unsigned index = 0; index < iterations; ++index) {
+        if (std::strcmp(pattern, "contained") == 0) ranges.Add(base + 128, 64);
+        else {
+          const uint64_t address = base + (std::strcmp(pattern, "prefix") == 0 ? 0 : 4096);
+          ranges.Subtract(address, 64);
+          ranges.Add(address, 64);
+        }
+      }
+      const auto ns = std::chrono::duration<double, std::nano>(
+          std::chrono::steady_clock::now() - start).count() / iterations;
+      Check(ranges.Contains(base, span), "range benchmark changed coverage");
+      std::printf("Range node CPU benchmark: %s reuse=%d %.2f ns/iteration\n", pattern, reuse, ns);
+    }
+  }
+  Common::LiveSwitches::Get("KYTY_RANGE_NODE_REUSE", 0).store(0);
+}
+
 void TestGuestRange() {
   constexpr GuestRange empty{};
   constexpr GuestRange first_byte{1, 1};
@@ -496,6 +582,41 @@ void BenchmarkCleanUploads() {
   Release(memory);
 }
 
+void TestConcurrentLargeRegionInitialization() {
+  constexpr uint64_t region = Libs::Graphics::TRACKER_REGION_SIZE;
+  constexpr uint64_t size = region * 4;
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto *memory = AllocateFixedGuestRange(size, region * 63);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  std::counting_semaphore<2> gate{0};
+  std::atomic_uint32_t ranges{0};
+  const auto upload = [&] {
+    gate.acquire();
+    tracker.ForEachUploadRange(address, size, false,
+      [&](uint64_t, uint64_t) noexcept { ranges.fetch_add(1, std::memory_order_relaxed); },
+      []() noexcept {});
+  };
+  std::jthread first(upload), second(upload);
+  gate.release(); gate.release(); first.join(); second.join();
+  Check(ranges == 4 && !tracker.IsRegionCpuModified(address, size),
+        "large region publication lost or duplicated initial CPU ownership");
+  tracker.MarkRegionAsCpuModified(address + region * 2 + 64, 4);
+  ranges = 0;
+  tracker.ForEachUploadRange(address, size, false,
+    [&](uint64_t, uint64_t) noexcept { ranges.fetch_add(1, std::memory_order_relaxed); },
+    []() noexcept {});
+  Check(ranges == 1, "presence bitmap hid a newly modified page");
+  tracker.UntrackMemory(address, size);
+  ranges = 0;
+  tracker.ForEachUploadRange(address, size, false,
+    [&](uint64_t, uint64_t) noexcept { ranges.fetch_add(1, std::memory_order_relaxed); },
+    []() noexcept {});
+  Check(ranges == 4, "presence bitmap hid CPU ownership after untracking");
+  tracker.UntrackMemory(address, size);
+  Release(memory);
+}
+
 void TestRangeInvalidation() {
   TrackerHarness harness;
   auto &tracker = harness.tracker;
@@ -523,6 +644,79 @@ void TestRangeInvalidation() {
   Check(flushes == 1,
         "clean range invalidation unnecessarily requested a GPU flush");
   tracker.UntrackMemory(address, size);
+  Release(memory);
+}
+
+void TestCleanWriteFaultCluster() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  constexpr uint64_t page = Libs::Graphics::TRACKER_PAGE_SIZE;
+  constexpr uint64_t size = 32 * page;
+  auto *memory = AllocateFixedGuestRange(size, 0x1000000);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  tracker.ForEachUploadRange(address, size, false,
+      [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+  // GPU-owned neighbours must bound the expansion, even within the cluster.
+  tracker.MarkRegionAsGpuModified(address + 5 * page, page);
+  tracker.MarkRegionAsGpuModified(address + 10 * page, page);
+  unsigned flushes = 0;
+  tracker.InvalidateRegion(address + 7 * page + 1, 1, [&] { ++flushes; }, 16);
+  Check(flushes == 0, "clean cluster unnecessarily flushed the GPU");
+  for (unsigned i = 0; i < 32; ++i) {
+    const bool dirty = i >= 6 && i < 10;
+    Check(tracker.IsRegionCpuModified(address + i * page, page) == dirty,
+          "cluster crossed GPU ownership or dirtied another cluster");
+    Check(IsWritable(memory + i * page) == dirty,
+          "cluster host protection differs from CPU dirty mask");
+  }
+  Check(tracker.IsRegionGpuModified(address + 5 * page, page) &&
+        tracker.IsRegionGpuModified(address + 10 * page, page),
+        "cluster discarded GPU ownership");
+  memory[8 * page] = 0x5a;
+  unsigned uploads = 0;
+  tracker.ForEachUploadRange(address + 8 * page, page, true,
+      [&](uint64_t from, uint64_t bytes) noexcept {
+        Check(from == address + 8 * page && bytes == page &&
+              memory[8 * page] == 0x5a, "cluster lost the next CPU write");
+        ++uploads;
+      }, []() noexcept {});
+  Check(uploads == 1 && tracker.IsRegionGpuModified(address + 8 * page, page) &&
+        !IsWritable(memory + 8 * page), "GPU did not reacquire a clustered page");
+  tracker.InvalidateRegion(address + 10 * page, 1, [&] { ++flushes; }, 16);
+  Check(flushes == 1 && !tracker.IsRegionCpuModified(address + 11 * page, page),
+        "GPU-owned fault expanded before its flush");
+  tracker.InvalidateRegion(address + 17 * page, 1, [&] { ++flushes; }, 0);
+  Check(!tracker.IsRegionCpuModified(address + 16 * page, page) &&
+        tracker.IsRegionCpuModified(address + 17 * page, page),
+        "default invalidation expanded");
+  tracker.InvalidateRegion(address + 20 * page, 1, [&] { ++flushes; }, 3);
+  Check(!tracker.IsRegionCpuModified(address + 19 * page, page) &&
+        !tracker.IsRegionCpuModified(address + 21 * page, page),
+        "invalid non-power-of-two cluster expanded");
+  tracker.UnmarkRegionAsGpuModified(address, size);
+  tracker.UntrackMemory(address, size);
+  Release(memory);
+}
+
+void TestWriteClusterKeepsOtherWatchers() {
+  TrackerHarness harness;
+  MemoryTracker other(harness.page_manager);
+  constexpr uint64_t page = Libs::Graphics::TRACKER_PAGE_SIZE;
+  constexpr uint64_t size = 16 * page;
+  auto *memory = AllocateFixedGuestRange(size, 0x1000000);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  for (auto *tracker : {&harness.tracker, &other}) {
+    tracker->ForEachUploadRange(address, size, false,
+        [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+  }
+  harness.tracker.InvalidateRegion(address + page, 1, [] {}, 16);
+  Check(harness.tracker.IsRegionCpuModified(address, size) &&
+        !IsWritable(memory + 2 * page), "cluster removed another cache's watcher");
+  other.InvalidateRegion(address + 2 * page, 1, [] {});
+  Check(IsWritable(memory + 2 * page) && !IsWritable(memory + 3 * page),
+        "other cache no longer faults independently");
+  other.UntrackMemory(address, size);
+  harness.tracker.UntrackMemory(address, size);
   Release(memory);
 }
 
@@ -1118,6 +1312,10 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size,
 } // namespace Libs::LibKernel::Memory
 
 int main(int argc, char **argv) {
+  if (argc == 2 && std::strcmp(argv[1], "--benchmark-range-nodes") == 0) {
+    BenchmarkRangeNodeReuse();
+    return 0;
+  }
   if (argc == 3 && std::strcmp(argv[1], "--death") == 0) {
     RunDeathCase(argv[2]);
   }
@@ -1127,11 +1325,15 @@ int main(int argc, char **argv) {
   }
   TestGuestRange();
   TestRangeSet();
+  TestRangeSetAgainstCoverage();
   TestQueriesDoNotRequireMappedOwnership();
   TestConcurrentRegionPublication();
+  TestConcurrentLargeRegionInitialization();
   TestCpuDirtyUpload();
   TestCleanUploadPreservesOwnership();
   TestRangeInvalidation();
+  TestCleanWriteFaultCluster();
+  TestWriteClusterKeepsOtherWatchers();
   TestGpuReacquisitionAfterInvalidation();
   TestGpuDirtyBits();
   TestExactDirtyIntervalsSharingTrackerPage();

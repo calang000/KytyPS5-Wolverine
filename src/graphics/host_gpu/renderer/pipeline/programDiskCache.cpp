@@ -402,7 +402,7 @@ namespace {
 static_assert(std::is_trivially_copyable_v<IR::MemoryInfo>);
 static_assert(std::is_trivially_copyable_v<IR::UniformFill>);
 
-constexpr uint32_t PlanFormatVersion = 1;
+constexpr uint32_t PlanFormatVersion = 2;
 
 // Opcodes this build knows; a record naming another is rejected.
 constexpr uint32_t ValueOpcodeCount = static_cast<uint32_t>(IR::ValueOpcode::Count);
@@ -562,6 +562,8 @@ bool SerializePlan(const IR::ResourcePlan& plan, std::vector<uint8_t>& out) {
 	for (const auto& value: plan.uniform_fill.values) {
 		p.Value(value);
 	}
+	w.U32(static_cast<uint32_t>(plan.gpu_flat_slots.size()));
+	w.Bytes(plan.gpu_flat_slots.data(), plan.gpu_flat_slots.size());
 	return p.Ok();
 }
 
@@ -569,7 +571,8 @@ bool DeserializePlan(std::span<const uint8_t> in, IR::ResourcePlan& plan) {
 	plan = IR::ResourcePlan {};
 	PlanReader p(in);
 	auto&      r = p.R();
-	if (r.U32() != PlanFormatVersion) {
+	const auto version = r.U32();
+	if (version != 1 && version != PlanFormatVersion) {
 		return false;
 	}
 	plan.stage           = r.Enum<ShaderType>();
@@ -678,6 +681,12 @@ bool DeserializePlan(std::span<const uint8_t> in, IR::ResourcePlan& plan) {
 	r.Bytes(&plan.uniform_fill.fill, sizeof(plan.uniform_fill.fill));
 	for (auto& value: plan.uniform_fill.values) {
 		value = p.Value();
+	}
+	if (version >= 2) {
+		count = r.U32();
+		if (count != 0 && count != plan.srt_reads.size()) return false;
+		plan.gpu_flat_slots.resize(count);
+		if (!r.Bytes(plan.gpu_flat_slots.data(), count)) return false;
 	}
 	return p.Ok() && in.empty();
 }
@@ -839,6 +848,9 @@ bool AffectsTranslation(std::string_view name) {
 	// Read under src/graphics/shader (2026-10-04); a new compile-time switch there should be
 	// added, though the word list below catches most.
 	static constexpr std::string_view Known[] = {
+	    "KYTY_LAZY_SRT_FLAT",
+	    "KYTY_MESH_INDIRECT_GPU",
+	    "KYTY_GPU_SCALAR_CONSTANTS",
 	    "KYTY_BINDLESS_SAMPLERS",          "KYTY_BINDLESS_SAMPLERS_HASH_BITS",
 	    "KYTY_BINDLESS_SAMPLERS_HASH_VALUE", "KYTY_BINDLESS_SAMPLERS_SKIP",
 	    "KYTY_BINDLESS_SAMPLER_CLASS_DEFAULTS", "KYTY_BINDLESS_SAMPLER_COPIES",
@@ -856,6 +868,8 @@ bool AffectsTranslation(std::string_view name) {
 	}
 	// Host-side or scheduling switches whose names match the words below.
 	static constexpr std::string_view Runtime[] = {
+	    "KYTY_MESH_TASK_RUNTIME",
+	    "KYTY_MESH_INDIRECT_RUNTIME",
 	    "KYTY_ASYNC_SHADERS",            "KYTY_ASYNC_SHADER_THREADS",
 	    "KYTY_RECOMPILER_LOCK",          "KYTY_SKIP_SHADER_HASHES",
 	    "KYTY_BINDLESS_SAMPLER_FIELDS",  "KYTY_BINDLESS_SAMPLER_RECHECK",

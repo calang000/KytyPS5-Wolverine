@@ -28,6 +28,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <memory>
@@ -490,6 +491,13 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		image_atomic_int64.pNext = supported_features2.pNext;
 		supported_features2.pNext = &image_atomic_int64;
 	}
+	const bool fragment_rate_extension =
+	    HasExtension(device_extensions, VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME);
+	vk::PhysicalDeviceFragmentShadingRateFeaturesKHR supported_fragment_rate {};
+	if (fragment_rate_extension) {
+		supported_fragment_rate.pNext = supported_features2.pNext;
+		supported_features2.pNext = &supported_fragment_rate;
+	}
 	physical_device.getFeatures2(&supported_features2);
 	graphics.shader_image_int64_atomics_enabled = image_atomic_int64.shaderImageInt64Atomics;
 
@@ -509,6 +517,10 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		    workgroup_layout.workgroupMemoryExplicitLayout != VK_FALSE));
 	}
 	graphics.mesh_shader_enabled = mesh_extension && supported_mesh.meshShader;
+	const char* task_requested = std::getenv("KYTY_MESH_TASK_INDIRECT");
+	graphics.task_shader_enabled = graphics.mesh_shader_enabled && supported_mesh.taskShader &&
+	    task_requested != nullptr && std::atoi(task_requested) != 0;
+	LOGF("Vulkan indirect mesh task stage: %s\n", graphics.task_shader_enabled ? "enabled" : "disabled");
 	graphics.sampler_filter_minmax_enabled = supported_features12.samplerFilterMinmax == VK_TRUE;
 	features12.samplerFilterMinmax         = supported_features12.samplerFilterMinmax;
 	LOGF("Vulkan sampler min/max reduction: %s\n",
@@ -664,6 +676,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	vk::PhysicalDeviceMeshShaderFeaturesEXT mesh_features {};
 	mesh_features.pNext                 = &features13;
 	mesh_features.meshShader            = graphics.mesh_shader_enabled;
+	mesh_features.taskShader            = graphics.task_shader_enabled;
 	feedback_dynamic.pNext =
 	    mesh_extension ? static_cast<void*>(&mesh_features) : static_cast<void*>(&features13);
 	create_info.pNext = graphics.attachment_feedback_loop_enabled
@@ -736,6 +749,31 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		image_atomic_int64.sparseImageInt64Atomics = VK_FALSE;
 		create_info.pNext = &image_atomic_int64;
 	}
+	vk::PhysicalDeviceFragmentShadingRateFeaturesKHR fragment_rate {};
+	const char* requested_vrs = std::getenv("KYTY_VRS_RATE");
+	if (fragment_rate_extension && supported_fragment_rate.pipelineFragmentShadingRate &&
+	    requested_vrs != nullptr && requested_vrs[0] == '2') {
+		uint32_t count = 0;
+		if (physical_device.getFragmentShadingRatesKHR(&count, nullptr) == vk::Result::eSuccess &&
+		    count != 0) {
+			std::vector<vk::PhysicalDeviceFragmentShadingRateKHR> rates(count);
+			if (physical_device.getFragmentShadingRatesKHR(&count, rates.data()) ==
+			    vk::Result::eSuccess) {
+				graphics.fragment_shading_rate_2x2_enabled =
+				    std::any_of(rates.begin(), rates.end(), [](const auto& rate) {
+					    return rate.fragmentSize.width == 2 && rate.fragmentSize.height == 2 &&
+					           (rate.sampleCounts & vk::SampleCountFlagBits::e1);
+				    });
+			}
+		}
+	}
+	if (graphics.fragment_shading_rate_2x2_enabled) {
+		fragment_rate.pipelineFragmentShadingRate = VK_TRUE;
+		fragment_rate.pNext = const_cast<void*>(create_info.pNext);
+		create_info.pNext = &fragment_rate;
+	}
+	LOGF("Vulkan fragment shading rate 2x2: %s\n",
+	     graphics.fragment_shading_rate_2x2_enabled ? "available" : "unavailable");
 	create_info.pQueueCreateInfos       = &queue_create_info;
 	create_info.queueCreateInfoCount    = 1;
 	create_info.enabledExtensionCount   = static_cast<uint32_t>(device_extensions.size());
@@ -1158,6 +1196,9 @@ void WindowContext::CreateVulkan() {
 		}
 		if (HasExtension(available_extensions, VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME);
+		}
+		if (HasExtension(available_extensions, VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME);
 		}
 		for (const auto* extension: {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
 		                             VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,

@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <deque>
 #include <optional>
+#include <unordered_map>
 
 namespace Libs::Graphics {
 
@@ -107,6 +108,7 @@ bool CommandScheduler::InDeferredOperation() noexcept {
 // command buffer removed) is added up, and every 5 s the log reports how busy the GPU was.
 struct CommandScheduler::GpuTimer {
 	static constexpr uint32_t Slots = 4096;
+	static constexpr uint32_t DrawSlots = 32768;
 
 	explicit GpuTimer(GraphicContext& graphics): graphics(graphics) {
 		vk::QueryPoolCreateInfo info {};
@@ -118,6 +120,9 @@ struct CommandScheduler::GpuTimer {
 		period_ns = graphics.GetPhysicalDeviceProperties().limits.timestampPeriod;
 	}
 	~GpuTimer() {
+		if (draw_pool) {
+			graphics.device.destroyQueryPool(draw_pool, nullptr);
+		}
 		if (pool) {
 			graphics.device.destroyQueryPool(pool, nullptr);
 		}
@@ -129,8 +134,114 @@ struct CommandScheduler::GpuTimer {
 		return enabled.load(std::memory_order_relaxed) != 0;
 	}
 
+	static bool DrawEnabled() {
+		static auto& enabled = Common::LiveSwitches::Get("KYTY_GPU_DRAW_PROFILE", 0);
+		return enabled.load(std::memory_order_relaxed) != 0;
+	}
+	static bool ComputeEnabled() {
+		static auto& enabled = Common::LiveSwitches::Get("KYTY_GPU_COMPUTE_PROFILE", 0);
+		return enabled.load(std::memory_order_relaxed) != 0;
+	}
+
+	void InitializeDrawPool(vk::CommandBuffer command) {
+		if ((!DrawEnabled() && !ComputeEnabled()) || draw_pool != nullptr || draw_pool_failed) {
+			return;
+		}
+		vk::QueryPoolCreateInfo info {};
+		info.queryType  = vk::QueryType::eTimestamp;
+		info.queryCount = DrawSlots * 2;
+		if (graphics.device.createQueryPool(&info, nullptr, &draw_pool) != vk::Result::eSuccess) {
+			draw_pool_failed = true;
+			return;
+		}
+		// All slots are reset before the first draw. Slots are never reused in this capture.
+		command.resetQueryPool(draw_pool, 0, DrawSlots * 2);
+		::printf("GPU shader profile: sampling 1/16 draws or compute dispatches (maximum %u samples)\n", DrawSlots);
+		std::fflush(stdout);
+	}
+
+	bool BeginDraw(vk::CommandBuffer command, uint64_t hash) {
+		if (!DrawEnabled() || !draw_pool || draw_samples.size() >= DrawSlots ||
+		    (++draw_seen % 16) != 0) {
+			return false;
+		}
+		const auto slot = static_cast<uint32_t>(draw_samples.size());
+		draw_samples.push_back({0, hash, false});
+		command.writeTimestamp2(vk::PipelineStageFlagBits2::eTopOfPipe, draw_pool, slot * 2);
+		return true;
+	}
+
+	bool BeginCompute(vk::CommandBuffer command, uint64_t hash) {
+		if (!ComputeEnabled() || !draw_pool || draw_samples.size() >= DrawSlots ||
+		    (++compute_seen % 16) != 0) {
+			return false;
+		}
+		const auto slot = static_cast<uint32_t>(draw_samples.size());
+		draw_samples.push_back({0, hash, true});
+		command.writeTimestamp2(vk::PipelineStageFlagBits2::eTopOfPipe, draw_pool, slot * 2);
+		return true;
+	}
+
+	void EndDraw(vk::CommandBuffer command) {
+		const auto slot = static_cast<uint32_t>(draw_samples.size() - 1);
+		command.writeTimestamp2(vk::PipelineStageFlagBits2::eBottomOfPipe, draw_pool,
+		                        slot * 2 + 1);
+	}
+
+	void CollectDraws(const auto& is_free) {
+		while (draw_collected < draw_submitted && is_free(draw_samples[draw_collected].tick)) {
+			const auto tick = draw_samples[draw_collected].tick;
+			size_t count = 0;
+			while (draw_collected + count < draw_submitted && count < 512 &&
+			       draw_samples[draw_collected + count].tick == tick) {
+				count++;
+			}
+			std::array<uint64_t, 1024> stamps {};
+			if (graphics.device.getQueryPoolResults(
+			        draw_pool, static_cast<uint32_t>(draw_collected * 2),
+			        static_cast<uint32_t>(count * 2), count * 2 * sizeof(uint64_t), stamps.data(),
+			        sizeof(uint64_t), vk::QueryResultFlagBits::e64) == vk::Result::eSuccess) {
+				for (size_t i = 0; i < count; i++) {
+					if (stamps[i * 2 + 1] >= stamps[i * 2]) {
+						const auto& sample = draw_samples[draw_collected + i];
+						auto& stat = draw_totals[{sample.hash, sample.compute}];
+						stat.first += static_cast<double>(stamps[i * 2 + 1] - stamps[i * 2]) *
+						              period_ns / 1e6;
+						stat.second++;
+					}
+				}
+			}
+			draw_collected += count;
+		}
+		const auto now = std::chrono::steady_clock::now();
+		if (!draw_totals.empty() && now - draw_report >= std::chrono::seconds(5)) {
+			double sampled_ms = 0;
+			for (const auto& [key, stat]: draw_totals) {
+				(void)key;
+				sampled_ms += stat.first;
+			}
+			std::vector<std::pair<SampleKey, std::pair<double, uint64_t>>> ranked {
+			    draw_totals.begin(), draw_totals.end()};
+			std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
+				return a.second.first > b.second.first;
+			});
+			::printf("GPU shaders (5 s): %zu new samples, %.2f ms sampled, %zu shader groups; top sampled GPU ms:\n",
+			         draw_collected - draw_reported, sampled_ms, ranked.size());
+			for (size_t i = 0; i < std::min<size_t>(ranked.size(), 12); i++) {
+				::printf("  %s %016" PRIx64 " %.2f ms / %" PRIu64 " samples\n",
+				         ranked[i].first.compute ? "compute" : "pixel", ranked[i].first.hash,
+				         ranked[i].second.first, ranked[i].second.second);
+			}
+			std::fflush(stdout);
+			draw_totals.clear();
+			draw_reported = draw_collected;
+			draw_report = now;
+		}
+	}
+
 	// GPU thread, a new command buffer.
 	void Begin(vk::CommandBuffer command) {
+		InitializeDrawPool(command);
 		open_slot = UINT32_MAX;
 		if (!pool || !Enabled() || pending.size() >= Slots) {
 			return;
@@ -149,6 +260,10 @@ struct CommandScheduler::GpuTimer {
 	}
 
 	void Submitted(uint64_t tick) {
+		for (size_t i = draw_submitted; i < draw_samples.size(); i++) {
+			draw_samples[i].tick = tick;
+		}
+		draw_submitted = draw_samples.size();
 		if (open_slot != UINT32_MAX) {
 			pending.push_back({tick, open_slot});
 			open_slot = UINT32_MAX;
@@ -157,6 +272,9 @@ struct CommandScheduler::GpuTimer {
 
 	template <typename IsFree>
 	void Collect(IsFree&& is_free) {
+		if (draw_pool) {
+			CollectDraws(is_free);
+		}
 		while (!pending.empty() && is_free(pending.front().tick)) {
 			const auto              slot = pending.front().slot;
 			std::array<uint64_t, 2> stamps {};
@@ -196,6 +314,21 @@ struct CommandScheduler::GpuTimer {
 		uint64_t tick = 0;
 		uint32_t slot = 0;
 	};
+	struct DrawSample {
+		uint64_t tick = 0;
+		uint64_t hash = 0;
+		bool compute = false;
+	};
+	struct SampleKey {
+		uint64_t hash = 0;
+		bool compute = false;
+		bool operator==(const SampleKey&) const = default;
+	};
+	struct SampleKeyHash {
+		size_t operator()(const SampleKey& key) const noexcept {
+			return std::hash<uint64_t> {}(key.hash) ^ (key.compute ? 0x9e3779b9u : 0u);
+		}
+	};
 
 	GraphicContext&                       graphics;
 	vk::QueryPool                         pool      = nullptr;
@@ -206,6 +339,16 @@ struct CommandScheduler::GpuTimer {
 	uint64_t                              last_end = 0;
 	double                                busy_ns  = 0;
 	uint64_t                              buffers  = 0;
+	vk::QueryPool                         draw_pool = nullptr;
+	bool                                  draw_pool_failed = false;
+	uint64_t                              draw_seen = 0;
+	uint64_t                              compute_seen = 0;
+	std::vector<DrawSample>               draw_samples;
+	size_t                                draw_submitted = 0;
+	size_t                                draw_collected = 0;
+	size_t                                draw_reported = 0;
+	std::unordered_map<SampleKey, std::pair<double, uint64_t>, SampleKeyHash> draw_totals;
+	std::chrono::steady_clock::time_point draw_report = std::chrono::steady_clock::now();
 	std::chrono::steady_clock::time_point report   = std::chrono::steady_clock::now();
 };
 
@@ -567,6 +710,28 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	m_command.m_buffer = nullptr;
 	m_command.m_open   = false;
 	return tick;
+}
+
+bool CommandScheduler::BeginGpuDrawSample(CommandBuffer& buffer, uint64_t pixel_shader_hash) {
+	if (m_threaded || !GpuTimer::DrawEnabled()) {
+		return false;
+	}
+	return m_gpu_timer->BeginDraw(buffer.Handle(), pixel_shader_hash);
+}
+
+void CommandScheduler::EndGpuDrawSample(CommandBuffer& buffer) {
+	m_gpu_timer->EndDraw(buffer.Handle());
+}
+
+bool CommandScheduler::BeginGpuComputeSample(CommandBuffer& buffer, uint64_t shader_hash) {
+	if (m_threaded || !GpuTimer::ComputeEnabled()) {
+		return false;
+	}
+	return m_gpu_timer->BeginCompute(buffer.Handle(), shader_hash);
+}
+
+void CommandScheduler::EndGpuComputeSample(CommandBuffer& buffer) {
+	m_gpu_timer->EndDraw(buffer.Handle());
 }
 
 // Research: KYTY_RECORD_THREAD (live, per command buffer; default 1, 0 records inline). Thread_Gpu spent ~15-20 %

@@ -1,0 +1,33 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x=1) in;
+layout(constant_id=0) const uint PRIMITIVE_SIZE=3;
+layout(constant_id=1) const uint PRIMITIVE_STEP=3;
+layout(constant_id=2) const uint PRIMITIVES_PER_GROUP=32;
+layout(constant_id=3) const uint MAX_GROUPS_X=65535;
+layout(constant_id=4) const uint MAX_GROUPS_Y=65535;
+layout(constant_id=5) const uint MAX_TOTAL=65535;
+layout(push_constant, std430) uniform Push {
+    uint input_count; uint first_vertex; uint first_instance; uint flags;
+    uint64_t args_address;
+} p;
+layout(buffer_reference, std430, buffer_reference_align=4) readonly buffer Args {
+    uint count; uint instances; uint first_vertex; uint first_instance;
+};
+struct DrawPayload { uint count; uint first_vertex; uint first_instance; };
+taskPayloadSharedEXT DrawPayload payload;
+void main() {
+    Args args=Args(p.args_address);
+    uint count=args.count, instances=args.instances;
+    payload.count=count; payload.first_vertex=args.first_vertex; payload.first_instance=args.first_instance;
+    uint groups=0;
+    if (count >= PRIMITIVE_SIZE && PRIMITIVE_STEP != 0 && PRIMITIVES_PER_GROUP != 0) {
+        uint primitives=(count-PRIMITIVE_SIZE)/PRIMITIVE_STEP+1;
+        groups=(primitives-1)/PRIMITIVES_PER_GROUP+1;
+    }
+    if (groups==0 || groups>MAX_GROUPS_X || instances>MAX_GROUPS_Y) { groups=0; instances=0; }
+    else if (instances>MAX_TOTAL/groups) { groups=0; instances=0; }
+    EmitMeshTasksEXT(groups, instances, 1);
+}
