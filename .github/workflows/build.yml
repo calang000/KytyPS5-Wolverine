@@ -33,16 +33,31 @@ jobs:
           $record=Get-Content ".github/release-validation/$tag.json" -Raw | ConvertFrom-Json
           if($record.tag -ne $tag -or $record.validated_commit -notmatch '^[0-9a-f]{40}$'){throw 'Invalid validation record'}
           if(!$record.native_tests_passed -or $record.movement_seconds -lt 60 -or !$record.normal_exit){throw 'Validation incomplete'}
-          git diff --quiet $record.validated_commit HEAD -- src CMakeLists.txt 3rdparty
+          git diff --quiet $record.validated_commit HEAD -- src CMakeLists.txt 3rdparty .gitmodules tools/wolverine/Start-Wolverine.ps1 'tools/wolverine/Play Wolverine.bat'
           if($LASTEXITCODE){throw 'Published code differs from validated code'}
           if(!$tag.Contains('-') -and !$record.stable_validation){throw 'Stable release requires broader validation'}
           if(!(Test-Path ".github/release-validation/$tag.md")){throw 'Release notes missing'}
+      - name: Locate glslang dependency cache
+        id: vcpkg
+        shell: pwsh
+        run: |
+          $root=Split-Path (Get-Command vcpkg).Source
+          $hash=(Get-FileHash "$root/ports/glslang/vcpkg.json" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "root=$root" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "key=glslang-${{ runner.os }}-x64-$hash-tools-opt" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+      - uses: actions/cache@v4
+        id: glslang_cache
+        with:
+          path: ${{ steps.vcpkg.outputs.root }}/installed/x64-windows
+          key: ${{ steps.vcpkg.outputs.key }}
       - name: Install glslang
         shell: pwsh
         run: |
-          $vcpkgRoot=Split-Path (Get-Command vcpkg).Source
-          vcpkg install glslang[tools,opt]:x64-windows
-          if($LASTEXITCODE){throw 'glslang installation failed'}
+          $vcpkgRoot="${{ steps.vcpkg.outputs.root }}"
+          if("${{ steps.glslang_cache.outputs.cache-hit }}" -ne 'true') {
+            vcpkg install glslang[tools,opt]:x64-windows
+            if($LASTEXITCODE){throw 'glslang installation failed'}
+          }
           "$vcpkgRoot\installed\x64-windows\tools\glslang" | Out-File $env:GITHUB_PATH -Append -Encoding utf8
       - name: Configure
         shell: pwsh
